@@ -144,7 +144,11 @@ impl EventHandler for Handler {
         if !on_own_msg {
             return;
         }
-        if let Some(name) = self.shared.consent.write().await.opted_users.remove(&user_id.to_string()) {
+        // NB: bind the removal result first — an `if let` scrutinee keeps its
+        // temporaries (here, the write guard) alive through the success block,
+        // which would deadlock against save_consent's read lock.
+        let removed = self.shared.consent.write().await.opted_users.remove(&user_id.to_string());
+        if let Some(name) = removed {
             self.shared.save_consent().await;
             tracing::info!(user = name, "opted out");
         }
