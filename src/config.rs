@@ -83,5 +83,9 @@ fn d_session_max_wakes() -> u64 { 50 }
 fn d_debounce() -> u64 { 3 }
 fn d_turn_timeout() -> u64 { 30 }
 fn d_disallowed() -> Vec<String> {
-    ["Bash", "Edit", "Write", "NotebookEdit"].map(String::from).to_vec()
+    // No filesystem access at all: the turn's cwd is the data dir, which holds
+    // the Discord token. Web tools stay (nothing secret left to exfiltrate).
+    ["Bash", "Edit", "Write", "Read", "Glob", "Grep", "LS", "NotebookEdit", "NotebookRead", "Task"]
+        .map(String::from)
+        .to_vec()
 }

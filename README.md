@@ -78,8 +78,9 @@ tokens. `RUST_LOG=bentham=debug` for chatter.
 ## Config
 
 See `config.toml` — model, wake debounce, session rotation, turn timeout, and
-which built-in Claude tools are disallowed (default: everything that touches
-the filesystem; it keeps read-only/web tools for looking things up). Runtime
+which built-in Claude tools are disallowed (default: all filesystem tools,
+read and write — the turn's cwd is `data/`, which holds the bot token; web
+tools remain for looking things up). Runtime
 behavior (channels, wake triggers) lives in `data/behavior.json` and is meant
 to be adjusted by the bot itself — or by you, by talking to it.
 
