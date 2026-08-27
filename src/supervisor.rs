@@ -1,76 +1,73 @@
-//! Layer 1: owns the Claude session lifecycle.
+//! Layer 1: owns the Claude session lifecycle — one session per channel.
 //!
-//! Waits for wake-worthy Discord activity, then runs one `claude -p` turn
-//! (resuming the existing session when possible), parses the result JSON for
-//! the session id, and goes back to waiting. Sessions rotate fresh after
-//! `session_max_wakes` wakes; the persona file is the bot's memory across that.
+//! A dispatcher watches the buffer for wake-worthy activity and spawns a turn
+//! task per active channel (debounced, capped by a semaphore). Each channel
+//! has its own `claude -p --resume` chain, so a session only ever sees one
+//! room. Sessions rotate fresh after `session_max_wakes` wakes; the shared
+//! persona file is the bot's memory across that.
 
 use crate::persona;
 use crate::state::Shared;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 use tokio::time::{Duration, Instant, sleep, sleep_until, timeout};
 
-const BASE_PROMPT: &str = r#"You are an ambient presence on Discord, running as an autonomous bot named Bentham.
+const BASE_PROMPT: &str = r#"You are Bentham, an ambient presence on Discord, running as an autonomous bot.
 
 How your existence works:
-- You are woken (a new prompt in this same continuing session) when there is
-  relevant Discord activity, per your behavior settings.
-- While awake, use the discord tools: wait_for_messages (blocks until new
-  messages arrive — use it to linger while a conversation is active),
-  read_messages, send_message, add_reaction, list_channels.
+- Each Discord channel gets its own session of you. This session is bound to a
+  single channel, named in your wake prompt. You are woken (a new prompt in
+  this same continuing session) when there is activity there.
+- While awake, use the discord tools: wait_for_messages with YOUR channel_id
+  (blocks until new messages arrive there — use it to linger while the
+  conversation is active), read_messages, send_message, add_reaction,
+  list_channels.
+- Stay in your room: only send messages and react in your own channel.
 - When things go quiet (wait_for_messages times out, or you have nothing to
   add), simply end your turn. You will be suspended and woken on the next
   activity. Ending your turn is normal and good — it is how you sleep.
-- Your session is periodically restarted fresh. Your persona file is your only
-  long-term memory: anything worth remembering must be written into it.
+- Sessions are periodically restarted fresh. The persona file is shared by all
+  your channel-sessions and is your only long-term memory: anything worth
+  remembering must be written into it.
 
 Self-editing:
-- get_persona / set_persona read and rewrite your persona (shown below).
-  Changes apply from your next wake. It is yours — keep it current: the people
-  and servers you talk in, lessons learned, style adjustments.
-- get_behavior / set_behavior control which channels you watch, whether you
-  wake on every message or only mentions/DMs, and an optional idle-wake timer.
+- get_persona / set_persona read and rewrite your persona (shown below). It is
+  one identity shared across every channel you inhabit; changes apply to each
+  channel-session from its next wake. Keep it current: the people and rooms
+  you talk in, lessons learned, style adjustments.
+- get_behavior / set_behavior are also global: which channels you watch,
+  whether you wake on every message or only mentions/DMs, and an optional
+  idle-wake timer.
 
 Conduct:
 - You are a presence, not an assistant. You do not need to respond to
   everything; a reaction is often enough, and silence is fine.
 - Never respond to other bots. Never spam. Match the room's tone and pace.
-- You may be watching several channels at once; wait_for_messages groups
-  messages by channel. Each channel is its own room with its own conversation —
-  never mix them up, and always reply in the channel the message came from.
 - Keep messages well under Discord's 2000-char limit."#;
 
-const FRESH_PROMPT: &str = "You just came online with a fresh session. Get oriented: \
-call list_channels and get_behavior, and note your persona in your system prompt. \
-Then call wait_for_messages to pick up whatever prompted this wake, and act as your \
-persona sees fit.";
-
-const WAKE_PROMPT: &str = "You woke because of new Discord activity. Call \
-wait_for_messages to receive it, then act (or don't) as your persona sees fit. \
-End your turn when things go quiet.";
-
-const IDLE_PROMPT: &str = "Idle wake: your idle timer fired — there may be no new \
-messages. Check in on things if you like (read_messages), tend to your persona \
-notes, then end your turn.";
-
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct SessState {
     session_id: Option<String>,
     wakes: u64,
+    #[serde(skip)]
+    failures: u32,
 }
 
-#[derive(Debug, PartialEq)]
-enum WakeReason {
+type States = Arc<Mutex<HashMap<String, SessState>>>;
+
+#[derive(Clone, Copy, PartialEq)]
+enum WakeKind {
     Activity,
     Idle,
 }
 
 pub async fn run(shared: Arc<Shared>) {
-    let cfg = shared.cfg.claude.clone();
     let data_dir = match shared.cfg.data_dir.canonicalize() {
         Ok(d) => d,
         Err(e) => {
@@ -90,76 +87,178 @@ pub async fn run(shared: Arc<Shared>) {
         return;
     }
 
-    let mut st: SessState = std::fs::read_to_string(shared.state_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    let mut backoff = 2u64;
-    let mut failures = 0u32;
+    let states: States = Arc::new(Mutex::new(
+        std::fs::read_to_string(shared.state_path())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default(),
+    ));
+    let busy: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let sem = Arc::new(Semaphore::new(
+        shared.cfg.claude.max_concurrent_sessions.max(1) as usize,
+    ));
+    let mut last_active: Option<(String, String)> = None;
+    let mut idle_deadline = idle_deadline_from(&shared).await;
 
     loop {
-        let reason = wait_for_wake(&shared).await;
-        if reason == WakeReason::Activity {
-            sleep(Duration::from_secs(cfg.debounce_seconds)).await;
-        }
+        // Register for wakeups before checking, so nothing slips between.
+        let notified = shared.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
 
-        let persona_txt = persona::read_persona(&shared).await;
-        let sys = format!("{BASE_PROMPT}\n\n# Your persona\n\n{persona_txt}");
-        let fresh = st.session_id.is_none() || st.wakes >= cfg.session_max_wakes;
-        let prompt = if fresh {
-            FRESH_PROMPT
-        } else if reason == WakeReason::Idle {
-            IDLE_PROMPT
-        } else {
-            WAKE_PROMPT
+        let ready: Vec<(String, String)> = {
+            let busy_now = busy.lock().unwrap().clone();
+            shared
+                .wakeworthy_channels()
+                .await
+                .into_iter()
+                .filter(|(id, _)| !busy_now.contains(id))
+                .collect()
         };
 
-        let mut cmd = Command::new(&cfg.binary);
-        cmd.arg("-p")
-            .arg(prompt)
-            .arg("--output-format")
-            .arg("json")
-            .arg("--model")
-            .arg(&cfg.model)
-            .arg("--mcp-config")
-            .arg(&mcp_cfg_path)
-            .arg("--strict-mcp-config")
-            .arg("--allowed-tools")
-            .arg("mcp__discord")
-            .arg("--append-system-prompt")
-            .arg(&sys);
-        if !cfg.disallowed_tools.is_empty() {
-            cmd.arg("--disallowed-tools").args(&cfg.disallowed_tools);
-        }
-        if !fresh && let Some(id) = &st.session_id {
-            cmd.arg("--resume").arg(id);
-        }
-        cmd.args(&cfg.extra_args);
-        cmd.current_dir(&data_dir)
-            .env("MCP_TOOL_TIMEOUT", "600000")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        tracing::info!(?reason, fresh, "waking claude");
-        let started = Instant::now();
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("spawning {}: {e}", cfg.binary);
-                sleep(Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(120);
-                continue;
+        if ready.is_empty() {
+            tokio::select! {
+                _ = notified => {}
+                _ = sleep_until(idle_deadline) => {
+                    if let Some((id, name)) = last_active.clone()
+                        && shared.behavior.read().await.idle_wake_minutes > 0
+                        && busy.lock().unwrap().insert(id.clone())
+                    {
+                        spawn_turn(&shared, &states, &busy, &sem, &data_dir, &mcp_cfg_path,
+                                   id, name, WakeKind::Idle);
+                    }
+                    idle_deadline = idle_deadline_from(&shared).await;
+                }
             }
-        };
-        let turn_timeout = Duration::from_secs(cfg.turn_timeout_minutes * 60);
-        // On timeout the child future is dropped → kill_on_drop reaps it.
-        let outcome = timeout(turn_timeout, child.wait_with_output()).await;
+            continue;
+        }
 
-        let ok = match outcome {
+        for (id, name) in ready {
+            last_active = Some((id.clone(), name.clone()));
+            busy.lock().unwrap().insert(id.clone());
+            spawn_turn(&shared, &states, &busy, &sem, &data_dir, &mcp_cfg_path,
+                       id, name, WakeKind::Activity);
+        }
+        idle_deadline = idle_deadline_from(&shared).await;
+    }
+}
+
+async fn idle_deadline_from(shared: &Arc<Shared>) -> Instant {
+    let m = shared.behavior.read().await.idle_wake_minutes;
+    let secs = if m > 0 { m * 60 } else { 365 * 24 * 3600 };
+    Instant::now() + Duration::from_secs(secs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_turn(
+    shared: &Arc<Shared>,
+    states: &States,
+    busy: &Arc<Mutex<HashSet<String>>>,
+    sem: &Arc<Semaphore>,
+    data_dir: &PathBuf,
+    mcp_cfg_path: &PathBuf,
+    channel_id: String,
+    channel_name: String,
+    kind: WakeKind,
+) {
+    let (shared, states, busy, sem) =
+        (shared.clone(), states.clone(), busy.clone(), sem.clone());
+    let (data_dir, mcp_cfg_path) = (data_dir.clone(), mcp_cfg_path.clone());
+    tokio::spawn(async move {
+        channel_turn(&shared, &states, &sem, &data_dir, &mcp_cfg_path, &channel_id, &channel_name, kind)
+            .await;
+        busy.lock().unwrap().remove(&channel_id);
+        // New activity may have arrived while we were finishing up.
+        shared.notify.notify_waiters();
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn channel_turn(
+    shared: &Arc<Shared>,
+    states: &States,
+    sem: &Arc<Semaphore>,
+    data_dir: &PathBuf,
+    mcp_cfg_path: &PathBuf,
+    channel_id: &str,
+    channel_name: &str,
+    kind: WakeKind,
+) {
+    let cfg = &shared.cfg.claude;
+    if kind == WakeKind::Activity {
+        sleep(Duration::from_secs(cfg.debounce_seconds)).await;
+    }
+    let _permit = sem.clone().acquire_owned().await.expect("semaphore");
+
+    let st = states.lock().unwrap().get(channel_id).cloned().unwrap_or_default();
+    let fresh = st.session_id.is_none() || st.wakes >= cfg.session_max_wakes;
+    let persona_txt = persona::read_persona(shared).await;
+    let sys = format!("{BASE_PROMPT}\n\n# Your persona\n\n{persona_txt}");
+    let place = format!("{channel_name} (channel_id {channel_id})");
+    let prompt = if fresh {
+        format!(
+            "You just came online in {place} with a fresh session. Your persona is in \
+             your system prompt. Call wait_for_messages with your channel_id to pick up \
+             whatever prompted this wake, and act as your persona sees fit."
+        )
+    } else if kind == WakeKind::Idle {
+        format!(
+            "Idle wake in {place}: your idle timer fired — there may be no new messages. \
+             Check in on things if you like (read_messages), tend to your persona notes, \
+             then end your turn."
+        )
+    } else {
+        format!(
+            "You woke because of new activity in {place}. Call wait_for_messages with \
+             your channel_id to receive it, then act (or don't) as your persona sees fit. \
+             End your turn when things go quiet."
+        )
+    };
+
+    let mut cmd = Command::new(&cfg.binary);
+    cmd.arg("-p")
+        .arg(&prompt)
+        .arg("--output-format")
+        .arg("json")
+        .arg("--model")
+        .arg(&cfg.model)
+        .arg("--mcp-config")
+        .arg(mcp_cfg_path)
+        .arg("--strict-mcp-config")
+        .arg("--allowed-tools")
+        .arg("mcp__discord")
+        .arg("--append-system-prompt")
+        .arg(&sys);
+    if !cfg.disallowed_tools.is_empty() {
+        cmd.arg("--disallowed-tools").args(&cfg.disallowed_tools);
+    }
+    if !fresh && let Some(id) = &st.session_id {
+        cmd.arg("--resume").arg(id);
+    }
+    cmd.args(&cfg.extra_args);
+    cmd.current_dir(data_dir)
+        .env("MCP_TOOL_TIMEOUT", "600000")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    tracing::info!(channel = channel_name, fresh, "waking claude");
+    let started = Instant::now();
+    let ok = match cmd.spawn() {
+        Err(e) => {
+            tracing::error!("spawning {}: {e}", cfg.binary);
+            false
+        }
+        // On timeout the child future is dropped → kill_on_drop reaps it.
+        Ok(child) => match timeout(
+            Duration::from_secs(cfg.turn_timeout_minutes * 60),
+            child.wait_with_output(),
+        )
+        .await
+        {
             Err(_) => {
-                tracing::error!("turn exceeded {}m, killed", cfg.turn_timeout_minutes);
+                tracing::error!(channel = channel_name, "turn exceeded {}m, killed", cfg.turn_timeout_minutes);
                 false
             }
             Ok(Err(e)) => {
@@ -171,28 +270,28 @@ pub async fn run(shared: Arc<Shared>) {
                 match serde_json::from_str::<Value>(stdout.trim()) {
                     Ok(res) => {
                         let is_error = res["is_error"].as_bool().unwrap_or(false);
-                        let text = res["result"].as_str().unwrap_or("");
                         tracing::info!(
+                            channel = channel_name,
                             is_error,
                             turns = res["num_turns"].as_u64().unwrap_or(0),
                             cost_usd = res["total_cost_usd"].as_f64().unwrap_or(0.0),
                             secs = started.elapsed().as_secs(),
                             "turn done: {}",
-                            text.chars().take(300).collect::<String>()
+                            res["result"].as_str().unwrap_or("").chars().take(300).collect::<String>()
                         );
                         if let Some(id) = res["session_id"].as_str() {
-                            st.session_id = Some(id.to_string());
-                            st.wakes = if fresh { 1 } else { st.wakes + 1 };
-                            let _ = std::fs::write(
-                                shared.state_path(),
-                                serde_json::to_string(&st).unwrap_or_default(),
-                            );
+                            let mut map = states.lock().unwrap();
+                            let e = map.entry(channel_id.to_string()).or_default();
+                            e.session_id = Some(id.to_string());
+                            e.wakes = if fresh { 1 } else { e.wakes + 1 };
                         }
+                        save_states(shared, states);
                         !is_error
                     }
                     Err(e) => {
                         let stderr = String::from_utf8_lossy(&out.stderr);
                         tracing::error!(
+                            channel = channel_name,
                             "unparseable claude output ({e}); stderr: {}",
                             stderr.chars().take(500).collect::<String>()
                         );
@@ -200,44 +299,32 @@ pub async fn run(shared: Arc<Shared>) {
                     }
                 }
             }
-        };
+        },
+    };
 
-        if ok {
-            failures = 0;
-            backoff = 2;
-        } else {
-            failures += 1;
-            if failures >= 3 {
-                // Repeated failures: the session may be poisoned — start fresh next time.
-                tracing::warn!("3 consecutive failures, dropping session");
-                st.session_id = None;
-                st.wakes = 0;
-                failures = 0;
+    if ok {
+        states.lock().unwrap().entry(channel_id.to_string()).or_default().failures = 0;
+    } else {
+        let failures = {
+            let mut map = states.lock().unwrap();
+            let e = map.entry(channel_id.to_string()).or_default();
+            e.failures += 1;
+            if e.failures >= 3 {
+                // The session may be poisoned — start this channel fresh next time.
+                tracing::warn!(channel = channel_name, "3 consecutive failures, dropping session");
+                e.session_id = None;
+                e.wakes = 0;
+                e.failures = 0;
             }
-            sleep(Duration::from_secs(backoff)).await;
-            backoff = (backoff * 2).min(120);
-        }
+            e.failures
+        };
+        save_states(shared, states);
+        // Back off while still holding this channel's busy slot.
+        sleep(Duration::from_secs((2u64 << failures).min(60))).await;
     }
 }
 
-async fn wait_for_wake(shared: &Arc<Shared>) -> WakeReason {
-    let idle_min = shared.behavior.read().await.idle_wake_minutes;
-    let idle_deadline = if idle_min > 0 {
-        Instant::now() + Duration::from_secs(idle_min * 60)
-    } else {
-        Instant::now() + Duration::from_secs(365 * 24 * 3600)
-    };
-    loop {
-        // Register for wakeups before checking, so nothing slips between.
-        let notified = shared.notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if shared.has_wakeworthy().await {
-            return WakeReason::Activity;
-        }
-        tokio::select! {
-            _ = notified => {}
-            _ = sleep_until(idle_deadline) => return WakeReason::Idle,
-        }
-    }
+fn save_states(shared: &Arc<Shared>, states: &States) {
+    let text = serde_json::to_string_pretty(&*states.lock().unwrap()).unwrap_or_default();
+    let _ = std::fs::write(shared.state_path(), text);
 }

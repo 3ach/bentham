@@ -14,8 +14,10 @@ binary = "claude"
 model = "sonnet"
 # Start a fresh session (persona = its only memory) after this many wakes.
 session_max_wakes = 50
-# Wait this long after first activity before waking, to batch bursts.
+# Wait this long after first activity in a channel before waking it, to batch bursts.
 debounce_seconds = 3
+# Each channel gets its own Claude session; at most this many run at once.
+max_concurrent_sessions = 3
 # Kill a Claude turn that runs longer than this.
 turn_timeout_minutes = 30
 # Tools the bot may NOT use (it always gets the discord MCP server).

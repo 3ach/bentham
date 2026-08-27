@@ -9,11 +9,13 @@ behavior over time.
 
 One binary, three layers:
 
-1. **Supervisor** (`src/supervisor.rs`) — owns the Claude session. Waits for
-   wake-worthy activity, then runs one `claude -p` turn (with `--resume` to
-   continue the same conversation), parses the result JSON for the session id,
-   and waits again. Sessions rotate fresh every `session_max_wakes` wakes;
-   crashes back off exponentially; 3 consecutive failures drop the session.
+1. **Supervisor** (`src/supervisor.rs`) — owns the Claude sessions, one per
+   channel. A dispatcher watches for wake-worthy activity and runs a
+   `claude -p` turn per active channel (debounced; at most
+   `max_concurrent_sessions` at once), resuming that channel's session via
+   `--resume`, so each session only ever sees its own room. Sessions rotate
+   fresh every `session_max_wakes` wakes; failures back off exponentially and
+   3 in a row drop that channel's session.
 
 2. **Discord MCP server** (`src/discord.rs`, `src/mcp.rs`) — a serenity
    gateway feeds an in-process message buffer; a minimal MCP streamable-HTTP
@@ -77,5 +79,5 @@ to be adjusted by the bot itself — or by you, by talking to it.
 
 - `data/persona.md` — self-editable identity + memory
 - `data/behavior.json` — self-editable behavior
-- `data/state.json` — current session id / wake count
+- `data/state.json` — per-channel session ids / wake counts
 - `data/discord-token` — bot token (gitignored, like all of `data/`)

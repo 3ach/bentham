@@ -60,6 +60,8 @@ pub struct ClaudeCfg {
     pub session_max_wakes: u64,
     #[serde(default = "d_debounce")]
     pub debounce_seconds: u64,
+    #[serde(default = "d_max_concurrent")]
+    pub max_concurrent_sessions: u64,
     #[serde(default = "d_turn_timeout")]
     pub turn_timeout_minutes: u64,
     #[serde(default = "d_disallowed")]
@@ -81,6 +83,7 @@ fn d_binary() -> String { "claude".into() }
 fn d_model() -> String { "sonnet".into() }
 fn d_session_max_wakes() -> u64 { 50 }
 fn d_debounce() -> u64 { 3 }
+fn d_max_concurrent() -> u64 { 3 }
 fn d_turn_timeout() -> u64 { 30 }
 fn d_disallowed() -> Vec<String> {
     ["Bash", "Edit", "Write", "NotebookEdit"].map(String::from).to_vec()

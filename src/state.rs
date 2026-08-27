@@ -1,7 +1,7 @@
 use crate::config::Config;
 use serde::{Deserialize, Serialize};
 use serenity::http::Http;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -58,8 +58,8 @@ pub struct Shared {
     pub notify: Notify,
     buf: Mutex<VecDeque<MsgEvent>>,
     next_seq: AtomicU64,
-    /// Highest seq handed to Claude via wait_for_messages.
-    delivered: AtomicU64,
+    /// Per-channel: highest seq handed to Claude via wait_for_messages.
+    delivered: Mutex<HashMap<String, u64>>,
 }
 
 impl Shared {
@@ -73,7 +73,7 @@ impl Shared {
             notify: Notify::new(),
             buf: Mutex::new(VecDeque::new()),
             next_seq: AtomicU64::new(0),
-            delivered: AtomicU64::new(0),
+            delivered: Mutex::new(HashMap::new()),
         }
     }
 
@@ -99,34 +99,48 @@ impl Shared {
             || beh.watched_channels.contains(&ev.channel_id)
     }
 
-    /// Undelivered events in watched channels; advances the delivered cursor
-    /// past everything currently buffered (unwatched messages are skipped for good).
-    pub async fn take_undelivered(&self) -> Vec<MsgEvent> {
-        let beh = self.behavior.read().await.clone();
+    /// Undelivered events for one channel; advances that channel's cursor.
+    pub async fn take_undelivered(&self, channel_id: &str) -> Vec<MsgEvent> {
         let buf = self.buf.lock().await;
-        let cur = self.delivered.load(Ordering::SeqCst);
+        let mut del = self.delivered.lock().await;
+        let cur = del.get(channel_id).copied().unwrap_or(0);
         let evs: Vec<MsgEvent> = buf
             .iter()
-            .filter(|e| e.seq > cur && Self::watched(&beh, e))
+            .filter(|e| e.channel_id == channel_id && e.seq > cur)
             .cloned()
             .collect();
         if let Some(max) = buf.back().map(|e| e.seq) {
-            self.delivered.fetch_max(max, Ordering::SeqCst);
+            del.insert(channel_id.to_string(), max);
         }
         evs
     }
 
-    /// Is there undelivered activity worth waking Claude for?
-    /// Never wakes for other bots (delivered as context, but no wake — avoids bot loops).
-    pub async fn has_wakeworthy(&self) -> bool {
+    /// Channels with undelivered activity worth waking Claude for, as
+    /// (channel_id, display_name). Never wakes for other bots (their messages
+    /// are delivered as context, but cause no wake — avoids bot loops).
+    pub async fn wakeworthy_channels(&self) -> Vec<(String, String)> {
         let beh = self.behavior.read().await.clone();
         let buf = self.buf.lock().await;
-        let cur = self.delivered.load(Ordering::SeqCst);
-        buf.iter().any(|e| {
-            e.seq > cur
+        let del = self.delivered.lock().await;
+        let mut out: Vec<(String, String)> = Vec::new();
+        for e in buf.iter() {
+            if e.seq > del.get(&e.channel_id).copied().unwrap_or(0)
                 && Self::watched(&beh, e)
                 && !e.author_is_bot
                 && (beh.respond_to == "all" || e.mentions_me || e.is_dm)
-        })
+                && !out.iter().any(|(id, _)| *id == e.channel_id)
+            {
+                let name = if e.is_dm {
+                    format!("your DM with {}", e.author_name)
+                } else {
+                    match &e.channel_name {
+                        Some(n) => format!("#{n}"),
+                        None => format!("channel {}", e.channel_id),
+                    }
+                };
+                out.push((e.channel_id.clone(), name));
+            }
+        }
+        out
     }
 }
