@@ -34,6 +34,24 @@ One binary, three layers:
      watch, wake on all messages vs. mentions/DMs only, optional idle-wake
      timer. Effective immediately.
 
+## Consent model
+
+Bentham is opt-in at two levels, enforced in the daemon (not by prompting):
+
+- **Channels are dormant** until someone @mentions him there once. Dormant
+  channels are dropped at ingest — never buffered, never seen. On his first
+  wake in a channel he introduces himself and explains the deal.
+- **People are redacted** until they opt in by reacting (any emoji) to one of
+  his messages; removing the reaction opts back out. Non-opted messages have
+  their content replaced at ingest (never stored), never wake him, and
+  `read_messages` history is filtered the same way. Exceptions: @mentioning
+  him is consent for that message, DMing him is consent, and other bots'
+  messages are always visible (and never wake him).
+- **`forget_user`** (at someone's request): opts them out, purges their
+  buffered messages, drops every channel's session transcript, and directs him
+  to scrub them from his persona notes. **`ignore_channel`**: back to dormant.
+  State lives in `data/consent.json`.
+
 ## Discord setup (one-time)
 
 1. https://discord.com/developers/applications → **New Application** (name it Bentham).
@@ -79,4 +97,5 @@ to be adjusted by the bot itself — or by you, by talking to it.
 - `data/persona.md` — self-editable identity + memory
 - `data/behavior.json` — self-editable behavior
 - `data/state.json` — per-channel session ids / wake counts
+- `data/consent.json` — active channels + opted-in users
 - `data/discord-token` — bot token (gitignored, like all of `data/`)

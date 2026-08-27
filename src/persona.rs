@@ -1,4 +1,4 @@
-use crate::state::{Behavior, Shared};
+use crate::state::{Behavior, Consent, Shared};
 use anyhow::Context as _;
 
 pub const DEFAULT_PERSONA: &str = r#"# Persona
@@ -35,6 +35,14 @@ pub async fn ensure_defaults(shared: &Shared) -> anyhow::Result<()> {
         }
     } else {
         save_behavior(shared).await?;
+    }
+    let cpath = shared.consent_path();
+    if cpath.exists() {
+        let text = tokio::fs::read_to_string(&cpath).await?;
+        match serde_json::from_str::<Consent>(&text) {
+            Ok(c) => *shared.consent.write().await = c,
+            Err(e) => tracing::warn!("ignoring corrupt {}: {e}", cpath.display()),
+        }
     }
     Ok(())
 }

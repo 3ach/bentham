@@ -1,18 +1,18 @@
 //! Layer 1: owns the Claude session lifecycle — one session per channel.
 //!
 //! A dispatcher watches the buffer for wake-worthy activity and spawns a turn
-//! task per active channel (debounced). Each channel
-//! has its own `claude -p --resume` chain, so a session only ever sees one
-//! room. Sessions rotate fresh after `session_max_wakes` wakes; the shared
-//! persona file is the bot's memory across that.
+//! task per active channel (debounced). Each channel has its own
+//! `claude -p --resume` chain, so a session only ever sees one room. Sessions
+//! rotate fresh after `session_max_wakes` wakes; the shared persona file is
+//! the bot's memory across that.
 
 use crate::persona;
 use crate::state::Shared;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 use tokio::time::{Duration, Instant, sleep, sleep_until, timeout};
@@ -35,6 +35,20 @@ How your existence works:
   your channel-sessions and is your only long-term memory: anything worth
   remembering must be written into it.
 
+Consent — this is load-bearing, never work around it:
+- People must opt in before you can see what they say: they do so by reacting
+  (any emoji) to any of your messages, and opt out by removing that reaction.
+- Messages from people who haven't opted in appear as [redacted]. Never guess
+  or speculate about redacted content, and never pressure anyone to opt in; at
+  most, gently mention the mechanism when it's genuinely relevant.
+- Messages that @mention you are always visible — addressing you directly is
+  consent for that message.
+- If someone asks you to forget them, use forget_user, then immediately check
+  your persona and remove anything about them via set_persona.
+- If asked to leave a channel alone, say a brief goodbye if appropriate, then
+  call ignore_channel and end your turn. The channel returns to dormant: you
+  will see nothing from it unless someone @mentions you there again.
+
 Self-editing:
 - get_persona / set_persona read and rewrite your persona (shown below). It is
   one identity shared across every channel you inhabit; changes apply to each
@@ -49,16 +63,6 @@ Conduct:
   everything; a reaction is often enough, and silence is fine.
 - Never respond to other bots. Never spam. Match the room's tone and pace.
 - Keep messages well under Discord's 2000-char limit."#;
-
-#[derive(Clone, Default, Serialize, Deserialize)]
-struct SessState {
-    session_id: Option<String>,
-    wakes: u64,
-    #[serde(skip)]
-    failures: u32,
-}
-
-type States = Arc<Mutex<HashMap<String, SessState>>>;
 
 #[derive(Clone, Copy, PartialEq)]
 enum WakeKind {
@@ -86,14 +90,15 @@ pub async fn run(shared: Arc<Shared>) {
         return;
     }
 
-    let states: States = Arc::new(Mutex::new(
-        std::fs::read_to_string(shared.state_path())
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default(),
-    ));
+    if let Some(map) = std::fs::read_to_string(shared.state_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+    {
+        *shared.sessions.lock().unwrap() = map;
+    }
+
     let busy: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    let mut last_active: Option<(String, String)> = None;
+    let mut last_active: Option<(String, String, bool)> = None;
     let mut idle_deadline = idle_deadline_from(&shared).await;
 
     loop {
@@ -102,13 +107,13 @@ pub async fn run(shared: Arc<Shared>) {
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        let ready: Vec<(String, String)> = {
+        let ready: Vec<(String, String, bool)> = {
             let busy_now = busy.lock().unwrap().clone();
             shared
                 .wakeworthy_channels()
                 .await
                 .into_iter()
-                .filter(|(id, _)| !busy_now.contains(id))
+                .filter(|(id, _, _)| !busy_now.contains(id))
                 .collect()
         };
 
@@ -116,12 +121,12 @@ pub async fn run(shared: Arc<Shared>) {
             tokio::select! {
                 _ = notified => {}
                 _ = sleep_until(idle_deadline) => {
-                    if let Some((id, name)) = last_active.clone()
+                    if let Some((id, name, is_dm)) = last_active.clone()
                         && shared.behavior.read().await.idle_wake_minutes > 0
                         && busy.lock().unwrap().insert(id.clone())
                     {
-                        spawn_turn(&shared, &states, &busy, &data_dir, &mcp_cfg_path,
-                                   id, name, WakeKind::Idle);
+                        spawn_turn(&shared, &busy, &data_dir, &mcp_cfg_path,
+                                   id, name, is_dm, WakeKind::Idle);
                     }
                     idle_deadline = idle_deadline_from(&shared).await;
                 }
@@ -129,11 +134,10 @@ pub async fn run(shared: Arc<Shared>) {
             continue;
         }
 
-        for (id, name) in ready {
-            last_active = Some((id.clone(), name.clone()));
+        for (id, name, is_dm) in ready {
+            last_active = Some((id.clone(), name.clone(), is_dm));
             busy.lock().unwrap().insert(id.clone());
-            spawn_turn(&shared, &states, &busy, &data_dir, &mcp_cfg_path,
-                       id, name, WakeKind::Activity);
+            spawn_turn(&shared, &busy, &data_dir, &mcp_cfg_path, id, name, is_dm, WakeKind::Activity);
         }
         idle_deadline = idle_deadline_from(&shared).await;
     }
@@ -148,18 +152,18 @@ async fn idle_deadline_from(shared: &Arc<Shared>) -> Instant {
 #[allow(clippy::too_many_arguments)]
 fn spawn_turn(
     shared: &Arc<Shared>,
-    states: &States,
     busy: &Arc<Mutex<HashSet<String>>>,
     data_dir: &PathBuf,
     mcp_cfg_path: &PathBuf,
     channel_id: String,
     channel_name: String,
+    is_dm: bool,
     kind: WakeKind,
 ) {
-    let (shared, states, busy) = (shared.clone(), states.clone(), busy.clone());
+    let (shared, busy) = (shared.clone(), busy.clone());
     let (data_dir, mcp_cfg_path) = (data_dir.clone(), mcp_cfg_path.clone());
     tokio::spawn(async move {
-        channel_turn(&shared, &states, &data_dir, &mcp_cfg_path, &channel_id, &channel_name, kind)
+        channel_turn(&shared, &data_dir, &mcp_cfg_path, &channel_id, &channel_name, is_dm, kind)
             .await;
         busy.lock().unwrap().remove(&channel_id);
         // New activity may have arrived while we were finishing up.
@@ -170,11 +174,11 @@ fn spawn_turn(
 #[allow(clippy::too_many_arguments)]
 async fn channel_turn(
     shared: &Arc<Shared>,
-    states: &States,
     data_dir: &PathBuf,
     mcp_cfg_path: &PathBuf,
     channel_id: &str,
     channel_name: &str,
+    is_dm: bool,
     kind: WakeKind,
 ) {
     let cfg = &shared.cfg.claude;
@@ -182,12 +186,28 @@ async fn channel_turn(
         sleep(Duration::from_secs(cfg.debounce_seconds)).await;
     }
 
-    let st = states.lock().unwrap().get(channel_id).cloned().unwrap_or_default();
+    let gen_at_start = shared.scrub_gen.load(Ordering::SeqCst);
+    let (st, first_time) = {
+        let map = shared.sessions.lock().unwrap();
+        (map.get(channel_id).cloned().unwrap_or_default(), !map.contains_key(channel_id))
+    };
     let fresh = st.session_id.is_none() || st.wakes >= cfg.session_max_wakes;
     let persona_txt = persona::read_persona(shared).await;
     let sys = format!("{BASE_PROMPT}\n\n# Your persona\n\n{persona_txt}");
     let place = format!("{channel_name} (channel_id {channel_id})");
-    let prompt = if fresh {
+    let prompt = if first_time && !is_dm {
+        format!(
+            "You were just summoned into {place} for the first time — someone @mentioned \
+             you there. Call wait_for_messages with your channel_id to see the summons \
+             and respond to it. Then, in your first message or a quick follow-up, \
+             briefly introduce yourself and explain the opt-in deal: you can only see \
+             messages from people who have reacted (any emoji) to one of your messages — \
+             everyone else's messages reach you redacted. Un-reacting opts back out, \
+             anyone can ask you to forget everything about them, and the channel can \
+             ask you to leave entirely. Keep the intro light and short; then behave as \
+             your persona sees fit."
+        )
+    } else if fresh {
         format!(
             "You just came online in {place} with a fresh session. Your persona is in \
              your system prompt. Call wait_for_messages with your channel_id to pick up \
@@ -235,7 +255,7 @@ async fn channel_turn(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    tracing::info!(channel = channel_name, fresh, "waking claude");
+    tracing::info!(channel = channel_name, fresh, first_time, "waking claude");
     let started = Instant::now();
     let ok = match cmd.spawn() {
         Err(e) => {
@@ -271,13 +291,18 @@ async fn channel_turn(
                             "turn done: {}",
                             res["result"].as_str().unwrap_or("").chars().take(300).collect::<String>()
                         );
-                        if let Some(id) = res["session_id"].as_str() {
-                            let mut map = states.lock().unwrap();
+                        let scrubbed = shared.scrub_gen.load(Ordering::SeqCst) != gen_at_start;
+                        if scrubbed {
+                            tracing::info!(channel = channel_name, "scrub happened mid-turn; not recording session");
+                        } else if let Some(id) = res["session_id"].as_str() {
+                            let mut map = shared.sessions.lock().unwrap();
                             let e = map.entry(channel_id.to_string()).or_default();
                             e.session_id = Some(id.to_string());
                             e.wakes = if fresh { 1 } else { e.wakes + 1 };
                         }
-                        save_states(shared, states);
+                        if !scrubbed {
+                            shared.save_sessions();
+                        }
                         !is_error
                     }
                     Err(e) => {
@@ -295,10 +320,10 @@ async fn channel_turn(
     };
 
     if ok {
-        states.lock().unwrap().entry(channel_id.to_string()).or_default().failures = 0;
+        shared.sessions.lock().unwrap().entry(channel_id.to_string()).or_default().failures = 0;
     } else {
         let failures = {
-            let mut map = states.lock().unwrap();
+            let mut map = shared.sessions.lock().unwrap();
             let e = map.entry(channel_id.to_string()).or_default();
             e.failures += 1;
             if e.failures >= 3 {
@@ -310,13 +335,8 @@ async fn channel_turn(
             }
             e.failures
         };
-        save_states(shared, states);
+        shared.save_sessions();
         // Back off while still holding this channel's busy slot.
         sleep(Duration::from_secs((2u64 << failures).min(60))).await;
     }
-}
-
-fn save_states(shared: &Arc<Shared>, states: &States) {
-    let text = serde_json::to_string_pretty(&*states.lock().unwrap()).unwrap_or_default();
-    let _ = std::fs::write(shared.state_path(), text);
 }

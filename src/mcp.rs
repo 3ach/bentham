@@ -12,7 +12,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use serenity::all::{ChannelId, ChannelType, MessageId, ReactionType};
+use serenity::all::{Channel, ChannelId, ChannelType, MessageId, ReactionType, UserId};
+use std::sync::atomic::Ordering;
 use serenity::http::MessagePagination;
 use std::sync::Arc;
 use tokio::time::{Duration, Instant, sleep_until};
@@ -69,6 +70,9 @@ async fn call_tool(s: &Arc<Shared>, params: Value) -> Result<Value, (i64, String
         "set_persona" => set_persona(s, &args).await,
         "get_behavior" => Ok(json!(s.behavior.read().await.clone())),
         "set_behavior" => set_behavior(s, &args).await,
+        "get_consent" => Ok(json!(s.consent.read().await.clone())),
+        "forget_user" => forget_user(s, &args).await,
+        "ignore_channel" => ignore_channel(s, &args).await,
         _ => return Err((-32602, format!("unknown tool: {name}"))),
     };
     Ok(match out {
@@ -123,18 +127,27 @@ async fn read_messages(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
         .await
         .map_err(|e| format!("fetching messages: {e}"))?;
     let bot_id = s.bot_id.get().copied().unwrap_or(0);
+    // History gets the same consent redaction as live messages.
+    let opted = s.consent.read().await.opted_users.clone();
+    let is_dm = matches!(s.http.get_channel(channel).await, Ok(Channel::Private(_)));
     // Discord returns newest-first; flip to reading order.
     let list: Vec<Value> = msgs
         .iter()
         .rev()
         .map(|m| {
+            let visible = is_dm
+                || m.author.bot
+                || m.author.id.get() == bot_id
+                || opted.contains_key(&m.author.id.to_string())
+                || (bot_id != 0 && m.mentions_user_id(UserId::new(bot_id)));
             json!({
                 "message_id": m.id.to_string(),
                 "author_name": m.author.name,
                 "author_id": m.author.id.to_string(),
                 "author_is_bot": m.author.bot,
                 "is_me": m.author.id.get() == bot_id,
-                "content": m.content,
+                "content": if visible { m.content.clone() } else { crate::discord::REDACTED.to_string() },
+                "redacted": !visible,
                 "timestamp": m.timestamp.to_string(),
                 "reply_to_message_id": m.message_reference.as_ref()
                     .and_then(|r| r.message_id).map(|i| i.to_string()),
@@ -241,6 +254,49 @@ async fn set_behavior(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
     Ok(json!({ "ok": true, "behavior": beh, "note": "in effect immediately" }))
 }
 
+/// Scrub a person on request: opt them out, purge their buffered messages,
+/// and drop every channel's session transcript so nothing they said carries
+/// forward. (Their persona-file traces are the caller's job — see the note.)
+async fn forget_user(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
+    let user_id = args["user_id"].as_str().ok_or("missing 'user_id'")?;
+    parse_id(user_id)?;
+    let name = s.consent.write().await.opted_users.remove(user_id);
+    s.save_consent().await;
+    s.purge_user(user_id).await;
+    s.sessions.lock().unwrap().clear();
+    s.scrub_gen.fetch_add(1, Ordering::SeqCst);
+    s.save_sessions();
+    Ok(json!({
+        "ok": true,
+        "was_opted_in_as": name,
+        "note": "User forgotten: opted out, their buffered messages purged, and ALL channel \
+                 session transcripts dropped (every channel, including this one, starts a \
+                 fresh session next wake). IMPORTANT: now call get_persona and remove \
+                 anything about this person via set_persona — that is the last place they \
+                 could persist. Do this before ending your turn."
+    }))
+}
+
+/// Return a channel to dormant: bentham sees nothing from it until someone
+/// @mentions him there again.
+async fn ignore_channel(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
+    let channel_id = args["channel_id"].as_str().ok_or("missing 'channel_id'")?;
+    parse_id(channel_id)?;
+    let was_active = s.consent.write().await.active_channels.remove(channel_id);
+    s.save_consent().await;
+    s.purge_channel(channel_id).await;
+    s.sessions.lock().unwrap().remove(channel_id);
+    s.scrub_gen.fetch_add(1, Ordering::SeqCst);
+    s.save_sessions();
+    Ok(json!({
+        "ok": true,
+        "was_active": was_active,
+        "note": "Channel is dormant again: you will see nothing from it unless someone \
+                 @mentions you there. Its session is gone. Do not send anything further \
+                 there — end your turn now."
+    }))
+}
+
 // ---------- helpers ----------
 
 fn parse_id(s: &str) -> Result<u64, String> {
@@ -334,6 +390,25 @@ fn tool_defs() -> Value {
             "name": "get_behavior",
             "description": "Read your behavior settings: watched_channels, respond_to, idle_wake_minutes.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "get_consent",
+            "description": "Read the consent state: which channels you are active in, and who has opted in to you seeing their messages.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "forget_user",
+            "description": "Scrub a person from your memory, at their request: opts them out, purges their buffered messages, and drops ALL channel session transcripts (every channel starts fresh next wake). Afterwards you MUST also remove any notes about them from your persona via set_persona.",
+            "inputSchema": { "type": "object", "required": ["user_id"], "properties": {
+                "user_id": { "type": "string", "description": "The Discord user id of the person asking to be forgotten." }
+            }}
+        },
+        {
+            "name": "ignore_channel",
+            "description": "Leave a channel, at its request: it returns to dormant — you see nothing from it until someone @mentions you there again, and its session transcript is dropped. Say any goodbye BEFORE calling this; afterwards, end your turn.",
+            "inputSchema": { "type": "object", "required": ["channel_id"], "properties": {
+                "channel_id": { "type": "string" }
+            }}
         },
         {
             "name": "set_behavior",
