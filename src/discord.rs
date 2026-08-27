@@ -1,6 +1,9 @@
 use crate::state::{ConsentPost, MsgEvent, Shared};
 use serde_json::json;
-use serenity::all::{Context, EventHandler, GatewayIntents, Message, Reaction, Ready, UserId};
+use serenity::all::{
+    ChannelId, ChannelType, Context, EventHandler, GatewayIntents, Guild, Message, Reaction,
+    Ready, UserId,
+};
 use serenity::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,27 +38,6 @@ impl EventHandler for Handler {
         let is_dm = msg.guild_id.is_none();
         let mentions_me = bot_id != 0 && msg.mentions_user_id(UserId::new(bot_id));
         let channel_id = msg.channel_id.to_string();
-
-        // Consent gate 1: dormant channels are invisible until bentham is
-        // summoned there by an @mention. (DMs are inherently active.)
-        if !is_dm {
-            let active = self.shared.consent.read().await.active_channels.contains(&channel_id);
-            if !active {
-                if !mentions_me {
-                    return; // never buffered, never seen
-                }
-                self.shared.consent.write().await.active_channels.insert(channel_id.clone());
-                self.shared.save_consent().await;
-                tracing::info!(channel = channel_id, "summoned into new channel");
-            }
-            if let Some(gid) = msg.guild_id {
-                self.ensure_consent_post(gid.to_string(), msg.channel_id).await;
-            }
-        }
-
-        // Consent gate 2: humans who haven't opted in get their content
-        // redacted at ingest (never stored). Addressing bentham directly is
-        // consent for that message; other bots have no privacy interest.
         let opted = self
             .shared
             .consent
@@ -63,7 +45,31 @@ impl EventHandler for Handler {
             .await
             .opted_users
             .contains_key(&msg.author.id.to_string());
-        let redacted = !is_dm && !mentions_me && !msg.author.bot && !opted;
+
+        // Consent gate 1: dormant channels are invisible until bentham is
+        // summoned there by an @mention from someone who has opted in —
+        // mentions carry no privileges for anyone else. (DMs are inherently
+        // active.)
+        if !is_dm {
+            let active = self.shared.consent.read().await.active_channels.contains(&channel_id);
+            if !active {
+                if !(mentions_me && opted) {
+                    return; // never buffered, never seen
+                }
+                self.shared.consent.write().await.active_channels.insert(channel_id.clone());
+                self.shared.save_consent().await;
+                tracing::info!(channel = channel_id, "summoned into new channel");
+            }
+            // Backstop; the consent post is normally created on guild join.
+            if let Some(gid) = msg.guild_id {
+                self.ensure_consent_post(gid.to_string(), msg.channel_id).await;
+            }
+        }
+
+        // Consent gate 2: humans who haven't opted in get their content
+        // redacted at ingest (never stored) — even when they @mention bentham.
+        // Other bots have no privacy interest. DMing him is consent.
+        let redacted = !is_dm && !msg.author.bot && !opted;
 
         let content = if redacted {
             REDACTED.to_string()
@@ -104,6 +110,31 @@ impl EventHandler for Handler {
             redacted,
         };
         self.shared.push_event(ev).await;
+    }
+
+    /// Fires on join and once per guild at startup: make sure the standing
+    /// consent post exists, since opting in via it is the only door into
+    /// bentham — even summons require it.
+    async fn guild_create(&self, _ctx: Context, guild: Guild, _is_new: Option<bool>) {
+        let gid = guild.id.to_string();
+        if self.shared.consent.read().await.consent_posts.contains_key(&gid) {
+            return;
+        }
+        let text_chans: Vec<_> = guild
+            .channels
+            .values()
+            .filter(|c| matches!(c.kind, ChannelType::Text | ChannelType::News))
+            .collect();
+        let target = text_chans
+            .iter()
+            .find(|c| c.name == "general")
+            .map(|c| c.id)
+            .or(guild.system_channel_id)
+            .or_else(|| text_chans.first().map(|c| c.id));
+        match target {
+            Some(t) => self.ensure_consent_post(gid, t).await,
+            None => tracing::warn!(guild = gid, "no text channel for consent notice"),
+        }
     }
 
     /// Reacting to the server's consent post = opting in.
@@ -168,7 +199,7 @@ impl Handler {
     /// Post the server's one standing consent notice if it doesn't exist yet.
     /// Goes to #general if there is one, else to the channel that triggered
     /// this. Posting is not watching: the target channel stays dormant.
-    async fn ensure_consent_post(&self, guild_id: String, fallback: serenity::all::ChannelId) {
+    async fn ensure_consent_post(&self, guild_id: String, fallback: ChannelId) {
         if self.shared.consent.read().await.consent_posts.contains_key(&guild_id) {
             return;
         }

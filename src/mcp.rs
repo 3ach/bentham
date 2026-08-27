@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use serenity::all::{Channel, ChannelId, ChannelType, MessageId, ReactionType, UserId};
+use serenity::all::{Channel, ChannelId, ChannelType, MessageId, ReactionType};
 use std::sync::atomic::Ordering;
 use serenity::http::MessagePagination;
 use std::sync::Arc;
@@ -138,8 +138,7 @@ async fn read_messages(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
             let visible = is_dm
                 || m.author.bot
                 || m.author.id.get() == bot_id
-                || opted.contains_key(&m.author.id.to_string())
-                || (bot_id != 0 && m.mentions_user_id(UserId::new(bot_id)));
+                || opted.contains_key(&m.author.id.to_string());
             json!({
                 "message_id": m.id.to_string(),
                 "author_name": m.author.name,

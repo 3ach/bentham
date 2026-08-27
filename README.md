@@ -38,17 +38,18 @@ One binary, three layers:
 
 Bentham is opt-in at two levels, enforced in the daemon (not by prompting):
 
-- **Channels are dormant** until someone @mentions him there once. Dormant
-  channels are dropped at ingest — never buffered, never seen.
-- **One consent post per server**: the daemon posts a standing notice (in
-  #general if it exists, else wherever he was first summoned) explaining the
-  deal. Posting is not watching — the channel stays dormant.
-- **People are redacted** until they opt in by reacting (any emoji) to that
-  consent post; removing the reaction opts back out. Non-opted messages have
-  their content replaced at ingest (never stored), never wake him, and
-  `read_messages` history is filtered the same way. Exceptions: @mentioning
-  him is consent for that message, DMing him is consent, and other bots'
-  messages are always visible (and never wake him).
+- **One consent post per server**: on joining a guild the daemon posts a
+  standing notice (in #general, else the system channel, else the first text
+  channel). Reacting to it (any emoji) is the only way in; removing the
+  reaction opts back out. Posting is not watching — every channel stays
+  dormant.
+- **Channels are dormant** until an opted-in person @mentions him there.
+  Dormant channels are dropped at ingest — never buffered, never seen.
+- **People are redacted** until they opt in — including their @mentions of
+  him, which are ignored entirely. Non-opted messages have their content
+  replaced at ingest (never stored), never wake him, and `read_messages`
+  history is filtered the same way. Exceptions: DMing him is consent, and
+  other bots' messages are always visible (and never wake him).
 - **`forget_user`** (at someone's request): opts them out, purges their
   buffered messages, drops every channel's session transcript, and directs him
   to scrub them from his persona notes. **`ignore_channel`**: back to dormant.
