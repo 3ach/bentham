@@ -52,6 +52,13 @@ impl Default for Behavior {
     }
 }
 
+/// The one consent post per server: reacting to it is how people opt in.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ConsentPost {
+    pub channel_id: String,
+    pub message_id: String,
+}
+
 /// Consent state: which channels bentham inhabits, and who has agreed to have
 /// their messages visible to him.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -60,10 +67,13 @@ pub struct Consent {
     /// Everything else is dropped at ingest, unseen.
     #[serde(default)]
     pub active_channels: HashSet<String>,
-    /// user id -> display name at opt-in time. Opt in by reacting to one of
-    /// bentham's messages; opt out by removing the reaction (or forget_user).
+    /// user id -> display name at opt-in time. Opt in by reacting to the
+    /// server's consent post; opt out by removing the reaction (or forget_user).
     #[serde(default)]
     pub opted_users: HashMap<String, String>,
+    /// guild id -> the standing consent post in that server.
+    #[serde(default)]
+    pub consent_posts: HashMap<String, ConsentPost>,
 }
 
 /// Per-channel Claude session bookkeeping (layer 1).
@@ -84,6 +94,8 @@ pub struct Shared {
     /// Bumped by forget_user / ignore_channel: in-flight turns that started
     /// before the bump must not re-record their session id afterward.
     pub scrub_gen: AtomicU64,
+    /// Serializes consent-post creation so concurrent messages can't double-post.
+    pub consent_post_lock: Mutex<()>,
     pub bot_id: OnceLock<u64>,
     pub bot_name: OnceLock<String>,
     pub notify: Notify,
@@ -102,6 +114,7 @@ impl Shared {
             consent: RwLock::new(Consent::default()),
             sessions: std::sync::Mutex::new(HashMap::new()),
             scrub_gen: AtomicU64::new(0),
+            consent_post_lock: Mutex::new(()),
             bot_id: OnceLock::new(),
             bot_name: OnceLock::new(),
             notify: Notify::new(),

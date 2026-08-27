@@ -37,7 +37,9 @@ How your existence works:
 
 Consent — this is load-bearing, never work around it:
 - People must opt in before you can see what they say: they do so by reacting
-  (any emoji) to any of your messages, and opt out by removing that reaction.
+  (any emoji) to your standing consent post — there is exactly one per server,
+  posted under your name, usually in #general — and opt out by removing that
+  reaction. Reactions to your other messages are just reactions.
 - Messages from people who haven't opted in appear as [redacted]. Never guess
   or speculate about redacted content, and never pressure anyone to opt in; at
   most, gently mention the mechanism when it's genuinely relevant.
@@ -199,13 +201,11 @@ async fn channel_turn(
         format!(
             "You were just summoned into {place} for the first time — someone @mentioned \
              you there. Call wait_for_messages with your channel_id to see the summons \
-             and respond to it. Then, in your first message or a quick follow-up, \
-             briefly introduce yourself and explain the opt-in deal: you can only see \
-             messages from people who have reacted (any emoji) to one of your messages — \
-             everyone else's messages reach you redacted. Un-reacting opts back out, \
-             anyone can ask you to forget everything about them, and the channel can \
-             ask you to leave entirely. Keep the intro light and short; then behave as \
-             your persona sees fit."
+             and respond to it. Greet the room briefly; no need to lecture about \
+             privacy — your standing consent post (usually in #general) covers the \
+             opt-in mechanics. If someone's messages reach you redacted or they seem \
+             confused about how you work, point them to that post. Then behave as your \
+             persona sees fit."
         )
     } else if fresh {
         format!(

@@ -1,8 +1,16 @@
-use crate::state::{MsgEvent, Shared};
+use crate::state::{ConsentPost, MsgEvent, Shared};
+use serde_json::json;
 use serenity::all::{Context, EventHandler, GatewayIntents, Message, Reaction, Ready, UserId};
 use serenity::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
+
+const CONSENT_POST: &str = "\u{1F44B} I'm bentham, an AI presence on this server. How privacy works with me:\n\
+\u{2022} I can only read messages from people who **opt in** \u{2014} react to **this message** with any emoji to opt in.\n\
+\u{2022} Remove your reaction any time to opt back out.\n\
+\u{2022} I only inhabit channels where someone @mentions me; everywhere else I see nothing.\n\
+\u{2022} Ask me to forget you and I'll scrub you from my memory. Ask me to leave a channel and I'll go.\n\
+Messages from anyone who hasn't opted in reach me redacted.";
 
 pub const REDACTED: &str = "[redacted — this person hasn't opted in. They can opt in by \
 reacting to any of your messages; do not speculate about what they said]";
@@ -39,6 +47,9 @@ impl EventHandler for Handler {
                 self.shared.consent.write().await.active_channels.insert(channel_id.clone());
                 self.shared.save_consent().await;
                 tracing::info!(channel = channel_id, "summoned into new channel");
+            }
+            if let Some(gid) = msg.guild_id {
+                self.ensure_consent_post(gid.to_string(), msg.channel_id).await;
             }
         }
 
@@ -95,21 +106,14 @@ impl EventHandler for Handler {
         self.shared.push_event(ev).await;
     }
 
-    /// Reacting to one of bentham's messages = opting in.
+    /// Reacting to the server's consent post = opting in.
     async fn reaction_add(&self, _ctx: Context, r: Reaction) {
         let bot_id = self.shared.bot_id.get().copied().unwrap_or(0);
-        let Some(user_id) = r.user_id else { return };
+        let (Some(gid), Some(user_id)) = (r.guild_id, r.user_id) else { return };
         if bot_id == 0 || user_id.get() == bot_id {
             return;
         }
-        let on_own_msg = match r.message_author_id {
-            Some(a) => a.get() == bot_id,
-            None => matches!(
-                self.shared.http.get_message(r.channel_id, r.message_id).await,
-                Ok(m) if m.author.id.get() == bot_id
-            ),
-        };
-        if !on_own_msg {
+        if !self.is_consent_post(&gid.to_string(), r.message_id.get()).await {
             return;
         }
         let name = match &r.member {
@@ -129,19 +133,14 @@ impl EventHandler for Handler {
         tracing::info!(user = name, "opted in");
     }
 
-    /// Removing a reaction from one of bentham's messages = opting back out.
+    /// Removing a reaction from the consent post = opting back out.
     async fn reaction_remove(&self, _ctx: Context, r: Reaction) {
         let bot_id = self.shared.bot_id.get().copied().unwrap_or(0);
-        let Some(user_id) = r.user_id else { return };
+        let (Some(gid), Some(user_id)) = (r.guild_id, r.user_id) else { return };
         if bot_id == 0 || user_id.get() == bot_id {
             return;
         }
-        // The remove event doesn't carry the message author; fetch to check.
-        let on_own_msg = matches!(
-            self.shared.http.get_message(r.channel_id, r.message_id).await,
-            Ok(m) if m.author.id.get() == bot_id
-        );
-        if !on_own_msg {
+        if !self.is_consent_post(&gid.to_string(), r.message_id.get()).await {
             return;
         }
         // NB: bind the removal result first — an `if let` scrutinee keeps its
@@ -151,6 +150,63 @@ impl EventHandler for Handler {
         if let Some(name) = removed {
             self.shared.save_consent().await;
             tracing::info!(user = name, "opted out");
+        }
+    }
+}
+
+impl Handler {
+    async fn is_consent_post(&self, guild_id: &str, message_id: u64) -> bool {
+        self.shared
+            .consent
+            .read()
+            .await
+            .consent_posts
+            .get(guild_id)
+            .is_some_and(|p| p.message_id == message_id.to_string())
+    }
+
+    /// Post the server's one standing consent notice if it doesn't exist yet.
+    /// Goes to #general if there is one, else to the channel that triggered
+    /// this. Posting is not watching: the target channel stays dormant.
+    async fn ensure_consent_post(&self, guild_id: String, fallback: serenity::all::ChannelId) {
+        if self.shared.consent.read().await.consent_posts.contains_key(&guild_id) {
+            return;
+        }
+        let _guard = self.shared.consent_post_lock.lock().await;
+        if self.shared.consent.read().await.consent_posts.contains_key(&guild_id) {
+            return;
+        }
+        let target = match guild_id.parse::<u64>() {
+            Ok(g) => self
+                .shared
+                .http
+                .get_channels(serenity::all::GuildId::new(g))
+                .await
+                .ok()
+                .and_then(|chans| {
+                    chans
+                        .into_iter()
+                        .find(|c| c.name == "general")
+                        .map(|c| c.id)
+                })
+                .unwrap_or(fallback),
+            Err(_) => fallback,
+        };
+        match self
+            .shared
+            .http
+            .send_message(target, vec![], &json!({ "content": CONSENT_POST }))
+            .await
+        {
+            Ok(m) => {
+                self.shared.consent.write().await.consent_posts.insert(
+                    guild_id.clone(),
+                    ConsentPost { channel_id: target.to_string(), message_id: m.id.to_string() },
+                );
+                self.shared.save_consent().await;
+                tracing::info!(guild = guild_id, channel = target.to_string(), "posted consent notice");
+            }
+            Err(e) => tracing::warn!(guild = guild_id, "couldn't post consent notice: {e}"),
         }
     }
 }
