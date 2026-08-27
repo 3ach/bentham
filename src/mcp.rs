@@ -92,7 +92,7 @@ async fn wait_for_messages(s: &Arc<Shared>, args: &Value) -> Result<Value, Strin
         notified.as_mut().enable();
         let evs = s.take_undelivered().await;
         if !evs.is_empty() {
-            return Ok(json!({ "messages": evs }));
+            return Ok(group_by_channel(&evs));
         }
         tokio::select! {
             _ = notified => {}
@@ -239,6 +239,39 @@ async fn set_behavior(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
 
 // ---------- helpers ----------
 
+/// Group events into per-channel conversations so simultaneous chatter in
+/// several channels reads as separate rooms, not one interleaved stream.
+fn group_by_channel(evs: &[crate::state::MsgEvent]) -> Value {
+    let mut groups: Vec<Value> = Vec::new();
+    for ev in evs {
+        let msg = json!({
+            "message_id": ev.message_id,
+            "author_name": ev.author_name,
+            "author_id": ev.author_id,
+            "author_is_bot": ev.author_is_bot,
+            "content": ev.content,
+            "timestamp": ev.timestamp,
+            "mentions_me": ev.mentions_me,
+            "reply_to_message_id": ev.reply_to_message_id,
+        });
+        match groups.iter_mut().find(|g| g["channel_id"] == json!(ev.channel_id)) {
+            Some(g) => g["messages"].as_array_mut().unwrap().push(msg),
+            None => groups.push(json!({
+                "channel_id": ev.channel_id,
+                "channel_name": ev.channel_name,
+                "guild_name": ev.guild_name,
+                "is_dm": ev.is_dm,
+                "messages": [msg],
+            })),
+        }
+    }
+    let mut out = json!({ "conversations": groups });
+    if out["conversations"].as_array().unwrap().len() > 1 {
+        out["note"] = json!("multiple channels were active — these are SEPARATE conversations in separate rooms; keep them straight and reply (if at all) in the channel each came from");
+    }
+    out
+}
+
 fn parse_id(s: &str) -> Result<u64, String> {
     match s.trim().parse::<u64>() {
         Ok(n) if n > 0 => Ok(n),
@@ -276,7 +309,7 @@ fn tool_defs() -> Value {
     json!([
         {
             "name": "wait_for_messages",
-            "description": "Block until new messages arrive in watched channels (or the timeout passes), and return them. This is how you listen: call it to linger in an active conversation. An empty result means things are quiet — usually a good moment to end your turn.",
+            "description": "Block until new messages arrive in watched channels (or the timeout passes), and return them grouped by channel — each group is a separate conversation. This is how you listen: call it to linger in an active conversation. An empty result means things are quiet — usually a good moment to end your turn.",
             "inputSchema": { "type": "object", "properties": {
                 "timeout_seconds": { "type": "number", "description": "How long to wait before giving up (default 240, max 480)." }
             }}
