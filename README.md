@@ -11,9 +11,8 @@ One binary, three layers:
 
 1. **Supervisor** (`src/supervisor.rs`) — owns the Claude sessions, one per
    channel. A dispatcher watches for wake-worthy activity and runs a
-   `claude -p` turn per active channel (debounced; at most
-   `max_concurrent_sessions` at once), resuming that channel's session via
-   `--resume`, so each session only ever sees its own room. Sessions rotate
+   `claude -p` turn per active channel (debounced), resuming that
+   channel's session via `--resume`, so each session only ever sees its own room. Sessions rotate
    fresh every `session_max_wakes` wakes; failures back off exponentially and
    3 in a row drop that channel's session.
 

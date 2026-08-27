@@ -1,7 +1,7 @@
 //! Layer 1: owns the Claude session lifecycle — one session per channel.
 //!
 //! A dispatcher watches the buffer for wake-worthy activity and spawns a turn
-//! task per active channel (debounced, capped by a semaphore). Each channel
+//! task per active channel (debounced). Each channel
 //! has its own `claude -p --resume` chain, so a session only ever sees one
 //! room. Sessions rotate fresh after `session_max_wakes` wakes; the shared
 //! persona file is the bot's memory across that.
@@ -15,7 +15,6 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
-use tokio::sync::Semaphore;
 use tokio::time::{Duration, Instant, sleep, sleep_until, timeout};
 
 const BASE_PROMPT: &str = r#"You are Bentham, an ambient presence on Discord, running as an autonomous bot.
@@ -94,9 +93,6 @@ pub async fn run(shared: Arc<Shared>) {
             .unwrap_or_default(),
     ));
     let busy: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    let sem = Arc::new(Semaphore::new(
-        shared.cfg.claude.max_concurrent_sessions.max(1) as usize,
-    ));
     let mut last_active: Option<(String, String)> = None;
     let mut idle_deadline = idle_deadline_from(&shared).await;
 
@@ -124,7 +120,7 @@ pub async fn run(shared: Arc<Shared>) {
                         && shared.behavior.read().await.idle_wake_minutes > 0
                         && busy.lock().unwrap().insert(id.clone())
                     {
-                        spawn_turn(&shared, &states, &busy, &sem, &data_dir, &mcp_cfg_path,
+                        spawn_turn(&shared, &states, &busy, &data_dir, &mcp_cfg_path,
                                    id, name, WakeKind::Idle);
                     }
                     idle_deadline = idle_deadline_from(&shared).await;
@@ -136,7 +132,7 @@ pub async fn run(shared: Arc<Shared>) {
         for (id, name) in ready {
             last_active = Some((id.clone(), name.clone()));
             busy.lock().unwrap().insert(id.clone());
-            spawn_turn(&shared, &states, &busy, &sem, &data_dir, &mcp_cfg_path,
+            spawn_turn(&shared, &states, &busy, &data_dir, &mcp_cfg_path,
                        id, name, WakeKind::Activity);
         }
         idle_deadline = idle_deadline_from(&shared).await;
@@ -154,18 +150,16 @@ fn spawn_turn(
     shared: &Arc<Shared>,
     states: &States,
     busy: &Arc<Mutex<HashSet<String>>>,
-    sem: &Arc<Semaphore>,
     data_dir: &PathBuf,
     mcp_cfg_path: &PathBuf,
     channel_id: String,
     channel_name: String,
     kind: WakeKind,
 ) {
-    let (shared, states, busy, sem) =
-        (shared.clone(), states.clone(), busy.clone(), sem.clone());
+    let (shared, states, busy) = (shared.clone(), states.clone(), busy.clone());
     let (data_dir, mcp_cfg_path) = (data_dir.clone(), mcp_cfg_path.clone());
     tokio::spawn(async move {
-        channel_turn(&shared, &states, &sem, &data_dir, &mcp_cfg_path, &channel_id, &channel_name, kind)
+        channel_turn(&shared, &states, &data_dir, &mcp_cfg_path, &channel_id, &channel_name, kind)
             .await;
         busy.lock().unwrap().remove(&channel_id);
         // New activity may have arrived while we were finishing up.
@@ -177,7 +171,6 @@ fn spawn_turn(
 async fn channel_turn(
     shared: &Arc<Shared>,
     states: &States,
-    sem: &Arc<Semaphore>,
     data_dir: &PathBuf,
     mcp_cfg_path: &PathBuf,
     channel_id: &str,
@@ -188,7 +181,6 @@ async fn channel_turn(
     if kind == WakeKind::Activity {
         sleep(Duration::from_secs(cfg.debounce_seconds)).await;
     }
-    let _permit = sem.clone().acquire_owned().await.expect("semaphore");
 
     let st = states.lock().unwrap().get(channel_id).cloned().unwrap_or_default();
     let fresh = st.session_id.is_none() || st.wakes >= cfg.session_max_wakes;
