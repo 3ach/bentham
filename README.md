@@ -34,6 +34,17 @@ One binary, three layers:
      watch, wake on all messages vs. mentions/DMs only, optional idle-wake
      timer. Effective immediately.
 
+## Isolation
+
+Every server is a separate bentham: separate persona file
+(`data/personas/<guild>.md`), separate behavior, separate opted-user list.
+Each DM conversation is likewise its own scope. Enforcement is structural:
+every turn gets a one-time session token, and all MCP tools resolve it to that
+turn's channel + scope — a session cannot read, post, or remember outside its
+scope. Whenever what he may remember changes (persona rewrite, forget_user,
+an opt-out), the scope's session transcripts are dropped and the next wake
+starts fresh.
+
 ## Consent model
 
 Bentham is opt-in at two levels, enforced in the daemon (not by prompting):
@@ -41,8 +52,10 @@ Bentham is opt-in at two levels, enforced in the daemon (not by prompting):
 - **One consent post per server**: on joining a guild the daemon posts a
   standing notice (in #general, else the system channel, else the first text
   channel). Reacting to it (any emoji) is the only way in; removing the
-  reaction opts back out. Posting is not watching — every channel stays
-  dormant.
+  reaction opts back out (and burns that server's session transcripts).
+  Posting is not watching — every channel stays dormant. On each restart the
+  post is edited in place (a "last restart" footer); if the record is lost,
+  the post is re-found by its marker line rather than reposted.
 - **Channels are dormant** until an opted-in person @mentions him there.
   Dormant channels are dropped at ingest — never buffered, never seen.
 - **People are redacted** until they opt in — including their @mentions of
@@ -53,7 +66,7 @@ Bentham is opt-in at two levels, enforced in the daemon (not by prompting):
 - **`forget_user`** (at someone's request): opts them out, purges their
   buffered messages, drops every channel's session transcript, and directs him
   to scrub them from his persona notes. **`ignore_channel`**: back to dormant.
-  State lives in `data/consent.json`.
+  State lives in `data/consent.json`, per guild.
 
 ## Discord setup (one-time)
 
@@ -97,8 +110,8 @@ to be adjusted by the bot itself — or by you, by talking to it.
 
 ## Files
 
-- `data/persona.md` — self-editable identity + memory
-- `data/behavior.json` — self-editable behavior
+- `data/personas/<scope>.md` — self-editable identity + memory, one per server/DM
+- `data/behaviors.json` — self-editable behavior, per scope
 - `data/state.json` — per-channel session ids / wake counts
 - `data/consent.json` — active channels + opted-in users
 - `data/discord-token` — bot token (gitignored, like all of `data/`)

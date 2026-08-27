@@ -1,19 +1,19 @@
 //! Layer 2: a minimal MCP streamable-HTTP server exposing Discord tools
-//! (and the layer-3 self-amendment tools) to the Claude session.
+//! (and the layer-3 self-amendment tools) to Claude sessions.
 //!
-//! Only the message surface Claude Code actually uses is implemented:
-//! initialize / ping / tools/list / tools/call, plain-JSON responses.
+//! Every tool takes the turn's session token; the daemon resolves it to the
+//! one channel + scope that turn may touch. Isolation across servers is
+//! enforced here, not by prompting.
 
 use crate::persona;
-use crate::state::Shared;
+use crate::state::{Shared, TurnCtx};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use serenity::all::{Channel, ChannelId, ChannelType, MessageId, ReactionType};
-use std::sync::atomic::Ordering;
+use serenity::all::{ChannelId, ChannelType, MessageId, ReactionType};
 use serenity::http::MessagePagination;
 use std::sync::Arc;
 use tokio::time::{Duration, Instant, sleep_until};
@@ -26,7 +26,6 @@ pub fn router(shared: Arc<Shared>) -> Router {
 
 async fn handle(State(s): State<Arc<Shared>>, Json(req): Json<Value>) -> Response {
     let Some(id) = req.get("id").filter(|v| !v.is_null()).cloned() else {
-        // Notification (e.g. notifications/initialized): accept and drop.
         return StatusCode::ACCEPTED.into_response();
     };
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
@@ -60,20 +59,23 @@ async fn call_tool(s: &Arc<Shared>, params: Value) -> Result<Value, (i64, String
         .ok_or((-32602, "missing tool name".to_string()))?;
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     tracing::info!(tool = name, "tool call");
-    let out = match name {
-        "wait_for_messages" => wait_for_messages(s, &args).await,
-        "read_messages" => read_messages(s, &args).await,
-        "send_message" => send_message(s, &args).await,
-        "add_reaction" => add_reaction(s, &args).await,
-        "list_channels" => list_channels(s).await,
-        "get_persona" => Ok(json!({ "persona": persona::read_persona(s).await })),
-        "set_persona" => set_persona(s, &args).await,
-        "get_behavior" => Ok(json!(s.behavior.read().await.clone())),
-        "set_behavior" => set_behavior(s, &args).await,
-        "get_consent" => Ok(json!(s.consent.read().await.clone())),
-        "forget_user" => forget_user(s, &args).await,
-        "ignore_channel" => ignore_channel(s, &args).await,
-        _ => return Err((-32602, format!("unknown tool: {name}"))),
+    let out = match ctx_of(s, &args) {
+        Err(e) => Err(e),
+        Ok(ctx) => match name {
+            "wait_for_messages" => wait_for_messages(s, &ctx, &args).await,
+            "read_messages" => read_messages(s, &ctx, &args).await,
+            "send_message" => send_message(s, &ctx, &args).await,
+            "add_reaction" => add_reaction(s, &ctx, &args).await,
+            "list_channels" => list_channels(s, &ctx).await,
+            "get_persona" => Ok(json!({ "persona": persona::read_persona(s, &ctx.scope).await })),
+            "set_persona" => set_persona(s, &ctx, &args).await,
+            "get_behavior" => Ok(json!(s.behavior_for(&ctx.scope).await)),
+            "set_behavior" => set_behavior(s, &ctx, &args).await,
+            "get_consent" => get_consent(s, &ctx).await,
+            "forget_user" => forget_user(s, &ctx, &args).await,
+            "ignore_channel" => ignore_channel(s, &ctx).await,
+            _ => return Err((-32602, format!("unknown tool: {name}"))),
+        },
     };
     Ok(match out {
         Ok(v) => {
@@ -84,13 +86,20 @@ async fn call_tool(s: &Arc<Shared>, params: Value) -> Result<Value, (i64, String
     })
 }
 
+fn ctx_of(s: &Arc<Shared>, args: &Value) -> Result<TurnCtx, String> {
+    let t = args["token"]
+        .as_str()
+        .ok_or("missing 'token' — your session token is in your wake prompt")?;
+    s.resolve_token(t).ok_or_else(|| "invalid or expired session token".to_string())
+}
+
+fn own_channel(ctx: &TurnCtx) -> Result<ChannelId, String> {
+    Ok(ChannelId::new(parse_id(&ctx.channel_id)?))
+}
+
 // ---------- tools ----------
 
-async fn wait_for_messages(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
-    let channel = args["channel_id"]
-        .as_str()
-        .ok_or("missing 'channel_id' — pass the channel this session is bound to")?
-        .to_string();
+async fn wait_for_messages(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
     let secs = args["timeout_seconds"].as_u64().unwrap_or(240).clamp(5, 480);
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -98,7 +107,7 @@ async fn wait_for_messages(s: &Arc<Shared>, args: &Value) -> Result<Value, Strin
         let notified = s.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let evs = s.take_undelivered(&channel).await;
+        let evs = s.take_undelivered(&ctx.channel_id).await;
         if !evs.is_empty() {
             return Ok(json!({ "messages": evs }));
         }
@@ -114,8 +123,8 @@ async fn wait_for_messages(s: &Arc<Shared>, args: &Value) -> Result<Value, Strin
     }
 }
 
-async fn read_messages(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
-    let channel = channel_arg(args)?;
+async fn read_messages(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
+    let channel = own_channel(ctx)?;
     let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as u8;
     let before = match args["before_message_id"].as_str() {
         Some(m) => Some(MessagePagination::Before(MessageId::new(parse_id(m)?))),
@@ -128,14 +137,20 @@ async fn read_messages(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
         .map_err(|e| format!("fetching messages: {e}"))?;
     let bot_id = s.bot_id.get().copied().unwrap_or(0);
     // History gets the same consent redaction as live messages.
-    let opted = s.consent.read().await.opted_users.clone();
-    let is_dm = matches!(s.http.get_channel(channel).await, Ok(Channel::Private(_)));
+    let opted = s
+        .consent
+        .read()
+        .await
+        .guilds
+        .get(&ctx.scope)
+        .map(|g| g.opted_users.clone())
+        .unwrap_or_default();
     // Discord returns newest-first; flip to reading order.
     let list: Vec<Value> = msgs
         .iter()
         .rev()
         .map(|m| {
-            let visible = is_dm
+            let visible = ctx.is_dm
                 || m.author.bot
                 || m.author.id.get() == bot_id
                 || opted.contains_key(&m.author.id.to_string());
@@ -156,8 +171,8 @@ async fn read_messages(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
     Ok(json!({ "messages": list }))
 }
 
-async fn send_message(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
-    let channel = channel_arg(args)?;
+async fn send_message(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
+    let channel = own_channel(ctx)?;
     let content = args["content"]
         .as_str()
         .filter(|c| !c.trim().is_empty())
@@ -182,8 +197,8 @@ async fn send_message(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
     Ok(json!({ "sent_message_ids": ids }))
 }
 
-async fn add_reaction(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
-    let channel = channel_arg(args)?;
+async fn add_reaction(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
+    let channel = own_channel(ctx)?;
     let msg = MessageId::new(parse_id(
         args["message_id"].as_str().ok_or("missing 'message_id'")?,
     )?);
@@ -197,42 +212,60 @@ async fn add_reaction(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
     Ok(json!({ "ok": true }))
 }
 
-async fn list_channels(s: &Arc<Shared>) -> Result<Value, String> {
-    let guilds = s
-        .http
-        .get_guilds(None, None)
-        .await
-        .map_err(|e| format!("listing guilds: {e}"))?;
-    let mut out = Vec::new();
-    for g in guilds {
-        let chans = s.http.get_channels(g.id).await.unwrap_or_default();
-        let chans: Vec<Value> = chans
-            .iter()
-            .filter(|c| matches!(c.kind, ChannelType::Text | ChannelType::News))
-            .map(|c| json!({ "channel_id": c.id.to_string(), "name": c.name }))
-            .collect();
-        out.push(json!({ "guild": g.name, "channels": chans }));
+async fn list_channels(s: &Arc<Shared>, ctx: &TurnCtx) -> Result<Value, String> {
+    if ctx.is_dm {
+        return Ok(json!({ "note": "this session is a DM — there is only this conversation" }));
     }
+    let gid = serenity::all::GuildId::new(parse_id(&ctx.scope)?);
+    let chans = s
+        .http
+        .get_channels(gid)
+        .await
+        .map_err(|e| format!("listing channels: {e}"))?;
+    let active = s
+        .consent
+        .read()
+        .await
+        .guilds
+        .get(&ctx.scope)
+        .map(|g| g.active_channels.clone())
+        .unwrap_or_default();
+    let list: Vec<Value> = chans
+        .iter()
+        .filter(|c| matches!(c.kind, ChannelType::Text | ChannelType::News))
+        .map(|c| {
+            json!({
+                "channel_id": c.id.to_string(),
+                "name": c.name,
+                "you_inhabit": active.contains(&c.id.to_string()),
+            })
+        })
+        .collect();
     Ok(json!({
-        "bot_user": {
-            "id": s.bot_id.get().map(|i| i.to_string()),
-            "name": s.bot_name.get(),
-        },
-        "guilds": out,
+        "bot_user": { "id": s.bot_id.get().map(|i| i.to_string()), "name": s.bot_name.get() },
+        "channels": list,
     }))
 }
 
-async fn set_persona(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
+async fn set_persona(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
     let content = args["content"]
         .as_str()
         .filter(|c| !c.trim().is_empty())
         .ok_or("missing or empty 'content' — set_persona replaces the whole file")?;
-    persona::write_persona(s, content).await?;
-    Ok(json!({ "ok": true, "note": "persona saved; it takes effect from your next wake" }))
+    persona::write_persona(s, &ctx.scope, content).await?;
+    // A new persona means a new mind: burn this scope's transcripts so the
+    // next wake starts fresh with it.
+    s.drop_scope_sessions(&ctx.scope).await;
+    Ok(json!({
+        "ok": true,
+        "note": "persona saved. All sessions in this scope (including this one) reset: next \
+                 wake starts a fresh session with the new persona, and transcript memory is \
+                 gone. Make sure everything worth keeping is written in the persona itself."
+    }))
 }
 
-async fn set_behavior(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
-    let mut beh = s.behavior.read().await.clone();
+async fn set_behavior(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
+    let mut beh = s.behavior_for(&ctx.scope).await;
     if let Some(w) = args.get("watched_channels").and_then(Value::as_array) {
         beh.watched_channels = w
             .iter()
@@ -248,51 +281,72 @@ async fn set_behavior(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
     if let Some(m) = args.get("idle_wake_minutes").and_then(Value::as_u64) {
         beh.idle_wake_minutes = m;
     }
-    *s.behavior.write().await = beh.clone();
-    persona::save_behavior(s).await.map_err(|e| e.to_string())?;
-    Ok(json!({ "ok": true, "behavior": beh, "note": "in effect immediately" }))
+    s.behaviors.write().await.insert(ctx.scope.clone(), beh.clone());
+    s.save_behaviors().await;
+    Ok(json!({ "ok": true, "behavior": beh, "note": "in effect immediately, this scope only" }))
 }
 
-/// Scrub a person on request: opt them out, purge their buffered messages,
-/// and drop every channel's session transcript so nothing they said carries
-/// forward. (Their persona-file traces are the caller's job — see the note.)
-async fn forget_user(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
+async fn get_consent(s: &Arc<Shared>, ctx: &TurnCtx) -> Result<Value, String> {
+    if ctx.is_dm {
+        return Ok(json!({ "note": "DMs are consent by definition; no registry here" }));
+    }
+    Ok(json!(s.consent.read().await.guilds.get(&ctx.scope).cloned().unwrap_or_default()))
+}
+
+/// Scrub a person from this server, at their request.
+async fn forget_user(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
+    if ctx.is_dm {
+        // Forgetting a DM partner = wiping the DM itself.
+        s.purge_channel(&ctx.channel_id).await;
+        s.drop_scope_sessions(&ctx.scope).await;
+        return Ok(json!({
+            "ok": true,
+            "note": "This DM's buffer and session are wiped. If your persona here mentions \
+                     them, rewrite it via set_persona (or leave it — it is scoped to this \
+                     DM only). End your turn now."
+        }));
+    }
     let user_id = args["user_id"].as_str().ok_or("missing 'user_id'")?;
     parse_id(user_id)?;
-    let name = s.consent.write().await.opted_users.remove(user_id);
+    let name = {
+        let mut c = s.consent.write().await;
+        c.guilds.entry(ctx.scope.clone()).or_default().opted_users.remove(user_id)
+    };
     s.save_consent().await;
-    s.purge_user(user_id).await;
-    s.sessions.lock().unwrap().clear();
-    s.scrub_gen.fetch_add(1, Ordering::SeqCst);
-    s.save_sessions();
+    s.purge_user(&ctx.scope, user_id).await;
+    s.drop_scope_sessions(&ctx.scope).await;
     Ok(json!({
         "ok": true,
         "was_opted_in_as": name,
-        "note": "User forgotten: opted out, their buffered messages purged, and ALL channel \
-                 session transcripts dropped (every channel, including this one, starts a \
-                 fresh session next wake). IMPORTANT: now call get_persona and remove \
-                 anything about this person via set_persona — that is the last place they \
-                 could persist. Do this before ending your turn."
+        "note": "User forgotten on this server: opted out, their buffered messages purged, \
+                 and every session transcript here dropped (all channels start fresh next \
+                 wake). IMPORTANT: now call get_persona and remove anything about this \
+                 person via set_persona — that is the last place they could persist. Do \
+                 this before ending your turn."
     }))
 }
 
-/// Return a channel to dormant: bentham sees nothing from it until someone
-/// @mentions him there again.
-async fn ignore_channel(s: &Arc<Shared>, args: &Value) -> Result<Value, String> {
-    let channel_id = args["channel_id"].as_str().ok_or("missing 'channel_id'")?;
-    parse_id(channel_id)?;
-    let was_active = s.consent.write().await.active_channels.remove(channel_id);
+/// Return this session's channel to dormant.
+async fn ignore_channel(s: &Arc<Shared>, ctx: &TurnCtx) -> Result<Value, String> {
+    if ctx.is_dm {
+        return Err("DMs can't be ignored — the person can simply stop writing, or ask you \
+                    to forget them (forget_user)"
+            .into());
+    }
+    {
+        let mut c = s.consent.write().await;
+        c.guilds.entry(ctx.scope.clone()).or_default().active_channels.remove(&ctx.channel_id);
+    }
     s.save_consent().await;
-    s.purge_channel(channel_id).await;
-    s.sessions.lock().unwrap().remove(channel_id);
-    s.scrub_gen.fetch_add(1, Ordering::SeqCst);
+    s.purge_channel(&ctx.channel_id).await;
+    s.sessions.lock().unwrap().remove(&ctx.channel_id);
+    s.scrub_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     s.save_sessions();
     Ok(json!({
         "ok": true,
-        "was_active": was_active,
-        "note": "Channel is dormant again: you will see nothing from it unless someone \
-                 @mentions you there. Its session is gone. Do not send anything further \
-                 there — end your turn now."
+        "note": "This channel is dormant again: you will see nothing from it unless an \
+                 opted-in person @mentions you there. Its session is gone. Do not send \
+                 anything further here — end your turn now."
     }))
 }
 
@@ -303,12 +357,6 @@ fn parse_id(s: &str) -> Result<u64, String> {
         Ok(n) if n > 0 => Ok(n),
         _ => Err(format!("bad Discord id: {s:?}")),
     }
-}
-
-fn channel_arg(args: &Value) -> Result<ChannelId, String> {
-    Ok(ChannelId::new(parse_id(
-        args["channel_id"].as_str().ok_or("missing 'channel_id'")?,
-    )?))
 }
 
 /// Split into ≤max_chars chunks (Discord's limit is 2000), preferring newline breaks.
@@ -332,91 +380,93 @@ fn split_chunks(s: &str, max_chars: usize) -> Vec<String> {
 }
 
 fn tool_defs() -> Value {
+    let tok = json!({ "type": "string", "description": "Your session token, from your wake prompt." });
     json!([
         {
             "name": "wait_for_messages",
-            "description": "Block until new messages arrive in YOUR channel (or the timeout passes), and return them. This is how you listen: call it to linger in an active conversation. An empty result means things are quiet — usually a good moment to end your turn.",
-            "inputSchema": { "type": "object", "required": ["channel_id"], "properties": {
-                "channel_id": { "type": "string", "description": "The channel this session is bound to." },
+            "description": "Block until new messages arrive in your channel (or the timeout passes), and return them. This is how you listen: call it to linger in an active conversation. An empty result means things are quiet — usually a good moment to end your turn.",
+            "inputSchema": { "type": "object", "required": ["token"], "properties": {
+                "token": tok.clone(),
                 "timeout_seconds": { "type": "number", "description": "How long to wait before giving up (default 240, max 480)." }
             }}
         },
         {
             "name": "read_messages",
-            "description": "Fetch recent message history for a channel (oldest first). Use for context; it does not affect what wait_for_messages returns.",
-            "inputSchema": { "type": "object", "required": ["channel_id"], "properties": {
-                "channel_id": { "type": "string" },
+            "description": "Fetch recent message history for your channel (oldest first), with the same consent redaction as live messages.",
+            "inputSchema": { "type": "object", "required": ["token"], "properties": {
+                "token": tok.clone(),
                 "limit": { "type": "number", "description": "1-50, default 20." },
                 "before_message_id": { "type": "string", "description": "Page further back from this message id." }
             }}
         },
         {
             "name": "send_message",
-            "description": "Send a message to a channel or DM channel. Content over 2000 chars is split into multiple messages. Returns the sent message id(s).",
-            "inputSchema": { "type": "object", "required": ["channel_id", "content"], "properties": {
-                "channel_id": { "type": "string" },
+            "description": "Send a message to your channel. Content over 2000 chars is split into multiple messages. Returns the sent message id(s).",
+            "inputSchema": { "type": "object", "required": ["token", "content"], "properties": {
+                "token": tok.clone(),
                 "content": { "type": "string" },
                 "reply_to_message_id": { "type": "string", "description": "Make this a reply to the given message." }
             }}
         },
         {
             "name": "add_reaction",
-            "description": "React to a message. Emoji is a unicode emoji (e.g. \"🔥\") or a custom emoji as \"name:id\".",
-            "inputSchema": { "type": "object", "required": ["channel_id", "message_id", "emoji"], "properties": {
-                "channel_id": { "type": "string" },
+            "description": "React to a message in your channel. Emoji is a unicode emoji (e.g. \"🔥\") or a custom emoji as \"name:id\".",
+            "inputSchema": { "type": "object", "required": ["token", "message_id", "emoji"], "properties": {
+                "token": tok.clone(),
                 "message_id": { "type": "string" },
                 "emoji": { "type": "string" }
             }}
         },
         {
             "name": "list_channels",
-            "description": "List the servers and text channels you can see, plus your own bot identity.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "List this server's text channels (marking which you inhabit), plus your own bot identity.",
+            "inputSchema": { "type": "object", "required": ["token"], "properties": { "token": tok.clone() } }
         },
         {
             "name": "get_persona",
-            "description": "Read your persona file (your self-editable identity and long-term memory).",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "Read your persona for this server (your self-editable identity and long-term memory here).",
+            "inputSchema": { "type": "object", "required": ["token"], "properties": { "token": tok.clone() } }
         },
         {
             "name": "set_persona",
-            "description": "Replace your persona file wholesale. It is injected into your system prompt at every wake, and it is your ONLY memory across session restarts — keep it current. Takes effect from your next wake.",
-            "inputSchema": { "type": "object", "required": ["content"], "properties": {
+            "description": "Replace your persona for this server, wholesale. It is your ONLY memory here. Saving it RESETS every session in this server (including this one) so the next wake starts fresh with the new persona — write down everything worth keeping.",
+            "inputSchema": { "type": "object", "required": ["token", "content"], "properties": {
+                "token": tok.clone(),
                 "content": { "type": "string", "description": "The full new persona markdown." }
             }}
         },
         {
             "name": "get_behavior",
-            "description": "Read your behavior settings: watched_channels, respond_to, idle_wake_minutes.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "Read this server's behavior settings: watched_channels, respond_to, idle_wake_minutes.",
+            "inputSchema": { "type": "object", "required": ["token"], "properties": { "token": tok.clone() } }
+        },
+        {
+            "name": "set_behavior",
+            "description": "Adjust this server's behavior settings (effective immediately). watched_channels: channel ids to watch, empty = all inhabited. respond_to: \"mentions\" wakes you only for @mentions/DMs, \"all\" for any opted-in message. idle_wake_minutes: wake on a timer, 0 = off.",
+            "inputSchema": { "type": "object", "required": ["token"], "properties": {
+                "token": tok.clone(),
+                "watched_channels": { "type": "array", "items": { "type": "string" } },
+                "respond_to": { "type": "string", "enum": ["mentions", "all"] },
+                "idle_wake_minutes": { "type": "number" }
+            }}
         },
         {
             "name": "get_consent",
-            "description": "Read the consent state: which channels you are active in, and who has opted in to you seeing their messages.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "Read this server's consent state: inhabited channels, opted-in people, and the consent post.",
+            "inputSchema": { "type": "object", "required": ["token"], "properties": { "token": tok.clone() } }
         },
         {
             "name": "forget_user",
-            "description": "Scrub a person from your memory, at their request: opts them out, purges their buffered messages, and drops ALL channel session transcripts (every channel starts fresh next wake). Afterwards you MUST also remove any notes about them from your persona via set_persona.",
-            "inputSchema": { "type": "object", "required": ["user_id"], "properties": {
+            "description": "Scrub a person from this server's memory, at their request: opts them out, purges their buffered messages, and drops every session transcript here (all channels start fresh next wake). Afterwards you MUST remove any notes about them from your persona via set_persona.",
+            "inputSchema": { "type": "object", "required": ["token", "user_id"], "properties": {
+                "token": tok.clone(),
                 "user_id": { "type": "string", "description": "The Discord user id of the person asking to be forgotten." }
             }}
         },
         {
             "name": "ignore_channel",
-            "description": "Leave a channel, at its request: it returns to dormant — you see nothing from it until someone @mentions you there again, and its session transcript is dropped. Say any goodbye BEFORE calling this; afterwards, end your turn.",
-            "inputSchema": { "type": "object", "required": ["channel_id"], "properties": {
-                "channel_id": { "type": "string" }
-            }}
-        },
-        {
-            "name": "set_behavior",
-            "description": "Adjust your behavior settings (effective immediately). watched_channels: channel ids to watch, empty = all (DMs always watched). respond_to: \"mentions\" wakes you only for @mentions/DMs, \"all\" for any human message. idle_wake_minutes: wake on a timer even when quiet, 0 = off.",
-            "inputSchema": { "type": "object", "properties": {
-                "watched_channels": { "type": "array", "items": { "type": "string" } },
-                "respond_to": { "type": "string", "enum": ["mentions", "all"] },
-                "idle_wake_minutes": { "type": "number" }
-            }}
+            "description": "Leave YOUR channel, at its request: it returns to dormant — you see nothing from it until an opted-in person @mentions you there again, and its session is dropped. Say any goodbye BEFORE calling this; afterwards, end your turn.",
+            "inputSchema": { "type": "object", "required": ["token"], "properties": { "token": tok.clone() } }
         }
     ])
 }

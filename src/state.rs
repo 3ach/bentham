@@ -28,12 +28,15 @@ pub struct MsgEvent {
     /// True when the author hasn't opted in: content was replaced at ingest
     /// and never stored. Redacted messages never cause a wake.
     pub redacted: bool,
+    /// Isolation scope this event belongs to (guild id, or "dm-<channel>").
+    #[serde(skip_serializing)]
+    pub scope: String,
 }
 
-/// Layer-3 behavior knobs, editable by the bot itself via set_behavior.
+/// Per-scope behavior knobs, editable by the bot itself via set_behavior.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Behavior {
-    /// Channel IDs to watch; empty = all channels the bot can see. DMs are always watched.
+    /// Channel IDs to watch within this scope; empty = all. DMs are always watched.
     #[serde(default)]
     pub watched_channels: Vec<String>,
     /// "mentions" = wake only for @mentions and DMs; "all" = wake for any opted-in human message.
@@ -59,21 +62,24 @@ pub struct ConsentPost {
     pub message_id: String,
 }
 
-/// Consent state: which channels bentham inhabits, and who has agreed to have
-/// their messages visible to him.
+/// Consent state for one server. Nothing here is shared across servers.
 #[derive(Clone, Default, Serialize, Deserialize)]
-pub struct Consent {
-    /// Channels where bentham has been summoned (@mentioned at least once).
-    /// Everything else is dropped at ingest, unseen.
+pub struct GuildConsent {
+    /// Channels where bentham has been summoned (@mentioned by an opted-in
+    /// person). Everything else is dropped at ingest, unseen.
     #[serde(default)]
     pub active_channels: HashSet<String>,
-    /// user id -> display name at opt-in time. Opt in by reacting to the
-    /// server's consent post; opt out by removing the reaction (or forget_user).
+    /// user id -> display name at opt-in time, for THIS server only.
     #[serde(default)]
     pub opted_users: HashMap<String, String>,
-    /// guild id -> the standing consent post in that server.
     #[serde(default)]
-    pub consent_posts: HashMap<String, ConsentPost>,
+    pub consent_post: Option<ConsentPost>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct Consent {
+    #[serde(default)]
+    pub guilds: HashMap<String, GuildConsent>,
 }
 
 /// Per-channel Claude session bookkeeping (layer 1).
@@ -85,16 +91,36 @@ pub struct SessState {
     pub failures: u32,
 }
 
+/// What a session token resolves to: the one channel and scope that turn may touch.
+#[derive(Clone)]
+pub struct TurnCtx {
+    pub channel_id: String,
+    pub scope: String,
+    pub is_dm: bool,
+}
+
+/// A channel the dispatcher decided to wake.
+#[derive(Clone)]
+pub struct WakeTarget {
+    pub channel_id: String,
+    pub name: String,
+    pub is_dm: bool,
+    pub scope: String,
+}
+
 pub struct Shared {
     pub cfg: Config,
     pub http: Arc<Http>,
-    pub behavior: RwLock<Behavior>,
+    /// scope -> behavior; missing scope = defaults.
+    pub behaviors: RwLock<HashMap<String, Behavior>>,
     pub consent: RwLock<Consent>,
     pub sessions: std::sync::Mutex<HashMap<String, SessState>>,
+    /// Live session tokens: the capability a turn presents to use the tools.
+    tokens: std::sync::Mutex<HashMap<String, TurnCtx>>,
     /// Bumped by forget_user / ignore_channel: in-flight turns that started
     /// before the bump must not re-record their session id afterward.
     pub scrub_gen: AtomicU64,
-    /// Serializes consent-post creation so concurrent messages can't double-post.
+    /// Serializes consent-post creation so concurrent events can't double-post.
     pub consent_post_lock: Mutex<()>,
     pub bot_id: OnceLock<u64>,
     pub bot_name: OnceLock<String>,
@@ -110,9 +136,10 @@ impl Shared {
         Self {
             http: Arc::new(Http::new(token)),
             cfg,
-            behavior: RwLock::new(Behavior::default()),
+            behaviors: RwLock::new(HashMap::new()),
             consent: RwLock::new(Consent::default()),
             sessions: std::sync::Mutex::new(HashMap::new()),
+            tokens: std::sync::Mutex::new(HashMap::new()),
             scrub_gen: AtomicU64::new(0),
             consent_post_lock: Mutex::new(()),
             bot_id: OnceLock::new(),
@@ -124,8 +151,8 @@ impl Shared {
         }
     }
 
-    pub fn persona_path(&self) -> PathBuf { self.cfg.data_dir.join("persona.md") }
-    pub fn behavior_path(&self) -> PathBuf { self.cfg.data_dir.join("behavior.json") }
+    pub fn personas_dir(&self) -> PathBuf { self.cfg.data_dir.join("personas") }
+    pub fn behaviors_path(&self) -> PathBuf { self.cfg.data_dir.join("behaviors.json") }
     pub fn state_path(&self) -> PathBuf { self.cfg.data_dir.join("state.json") }
     pub fn consent_path(&self) -> PathBuf { self.cfg.data_dir.join("consent.json") }
 
@@ -135,17 +162,73 @@ impl Shared {
         let _ = tokio::fs::write(self.consent_path(), text).await;
     }
 
+    pub async fn save_behaviors(&self) {
+        let b = self.behaviors.read().await.clone();
+        let text = serde_json::to_string_pretty(&b).unwrap_or_default();
+        let _ = tokio::fs::write(self.behaviors_path(), text).await;
+    }
+
     pub fn save_sessions(&self) {
         let text = serde_json::to_string_pretty(&*self.sessions.lock().unwrap()).unwrap_or_default();
         let _ = std::fs::write(self.state_path(), text);
     }
 
+    pub async fn behavior_for(&self, scope: &str) -> Behavior {
+        self.behaviors.read().await.get(scope).cloned().unwrap_or_default()
+    }
+
+    // ---- session tokens ----
+
+    pub fn new_token(&self, ctx: TurnCtx) -> String {
+        use std::io::Read as _;
+        let mut b = [0u8; 16];
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let _ = f.read_exact(&mut b);
+        }
+        let tok: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        self.tokens.lock().unwrap().insert(tok.clone(), ctx);
+        tok
+    }
+
+    pub fn resolve_token(&self, token: &str) -> Option<TurnCtx> {
+        self.tokens.lock().unwrap().get(token).cloned()
+    }
+
+    pub fn drop_token(&self, token: &str) {
+        self.tokens.lock().unwrap().remove(token);
+    }
+
+    /// Drop all session transcripts belonging to one scope and bump the
+    /// scrub generation so in-flight turns don't re-record them. Used when
+    /// what bentham is allowed to remember changes: persona rewrites,
+    /// forget_user, opt-outs, leaving a channel.
+    pub async fn drop_scope_sessions(&self, scope: &str) {
+        if let Some(chan) = scope.strip_prefix("dm-") {
+            self.sessions.lock().unwrap().remove(chan);
+        } else {
+            let chans = self
+                .consent
+                .read()
+                .await
+                .guilds
+                .get(scope)
+                .map(|g| g.active_channels.clone())
+                .unwrap_or_default();
+            self.sessions.lock().unwrap().retain(|ch, _| !chans.contains(ch));
+        }
+        self.scrub_gen.fetch_add(1, Ordering::SeqCst);
+        self.save_sessions();
+    }
+
+    // ---- message buffer ----
+
     pub async fn purge_channel(&self, channel_id: &str) {
         self.buf.lock().await.retain(|e| e.channel_id != channel_id);
     }
 
-    pub async fn purge_user(&self, user_id: &str) {
-        self.buf.lock().await.retain(|e| e.author_id != user_id);
+    /// Purge one user's messages within one scope only.
+    pub async fn purge_user(&self, scope: &str, user_id: &str) {
+        self.buf.lock().await.retain(|e| !(e.scope == scope && e.author_id == user_id));
     }
 
     pub async fn push_event(&self, mut ev: MsgEvent) {
@@ -182,21 +265,21 @@ impl Shared {
         evs
     }
 
-    /// Channels with undelivered activity worth waking Claude for, as
-    /// (channel_id, display_name, is_dm). Redacted messages and other bots
-    /// never wake (their events are context only — avoids bot loops).
-    pub async fn wakeworthy_channels(&self) -> Vec<(String, String, bool)> {
-        let beh = self.behavior.read().await.clone();
+    /// Channels with undelivered activity worth waking Claude for. Redacted
+    /// messages and other bots never wake (context only — avoids bot loops).
+    pub async fn wakeworthy_channels(&self) -> Vec<WakeTarget> {
+        let behs = self.behaviors.read().await.clone();
         let buf = self.buf.lock().await;
         let del = self.delivered.lock().await;
-        let mut out: Vec<(String, String, bool)> = Vec::new();
+        let mut out: Vec<WakeTarget> = Vec::new();
         for e in buf.iter() {
+            let beh = behs.get(&e.scope).cloned().unwrap_or_default();
             if e.seq > del.get(&e.channel_id).copied().unwrap_or(0)
                 && Self::watched(&beh, e)
                 && !e.author_is_bot
                 && !e.redacted
                 && (beh.respond_to == "all" || e.mentions_me || e.is_dm)
-                && !out.iter().any(|(id, _, _)| *id == e.channel_id)
+                && !out.iter().any(|t| t.channel_id == e.channel_id)
             {
                 let name = if e.is_dm {
                     format!("your DM with {}", e.author_name)
@@ -206,7 +289,12 @@ impl Shared {
                         None => format!("channel {}", e.channel_id),
                     }
                 };
-                out.push((e.channel_id.clone(), name, e.is_dm));
+                out.push(WakeTarget {
+                    channel_id: e.channel_id.clone(),
+                    name,
+                    is_dm: e.is_dm,
+                    scope: e.scope.clone(),
+                });
             }
         }
         out
