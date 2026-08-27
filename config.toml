@@ -19,7 +19,7 @@ debounce_seconds = 3
 # Kill a Claude turn that runs longer than this.
 turn_timeout_minutes = 30
 # Tools the bot may NOT use (it always gets the discord MCP server).
-# Everything filesystem-shaped is denied — the turn's cwd holds the bot token.
-disallowed_tools = ["Bash", "Edit", "Write", "Read", "Glob", "Grep", "LS", "NotebookEdit", "NotebookRead", "Task"]
+# All built-ins denied: he's a conversationalist, not an agent.
+disallowed_tools = ["Bash", "BashOutput", "KillShell", "Edit", "MultiEdit", "Write", "Read", "Glob", "Grep", "LS", "NotebookEdit", "NotebookRead", "Task", "WebFetch", "WebSearch", "TodoWrite", "ExitPlanMode"]
 # Extra args appended to every claude invocation.
 extra_args = []
