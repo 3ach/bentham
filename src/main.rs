@@ -54,6 +54,22 @@ async fn main() -> anyhow::Result<()> {
     // Layer 2: Discord gateway feeding the message buffer.
     tokio::spawn(discord::run(token, shared.clone()));
 
+    // Typing indicator: pulse "bentham is typing…" wherever a turn is
+    // actively inferring (Discord's indicator lasts ~10s; refresh under that).
+    {
+        let s = shared.clone();
+        tokio::spawn(async move {
+            loop {
+                for ch in s.channels_inferring() {
+                    if let Ok(id) = ch.parse::<u64>() {
+                        let _ = s.http.broadcast_typing(serenity::all::ChannelId::new(id)).await;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            }
+        });
+    }
+
     // Layer 1: Claude session supervisor. Runs until ctrl-c.
     tokio::select! {
         _ = supervisor::run(shared.clone()) => {}

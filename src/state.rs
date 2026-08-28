@@ -117,6 +117,10 @@ pub struct Shared {
     pub sessions: std::sync::Mutex<HashMap<String, SessState>>,
     /// Live session tokens: the capability a turn presents to use the tools.
     tokens: std::sync::Mutex<HashMap<String, TurnCtx>>,
+    /// Channels with a claude turn in flight / parked in wait_for_messages.
+    /// Their difference = channels actively inferring (shown as typing).
+    pub typing_active: std::sync::Mutex<HashSet<String>>,
+    pub typing_waiting: std::sync::Mutex<HashSet<String>>,
     /// Bumped by forget_user / ignore_channel: in-flight turns that started
     /// before the bump must not re-record their session id afterward.
     pub scrub_gen: AtomicU64,
@@ -140,6 +144,8 @@ impl Shared {
             consent: RwLock::new(Consent::default()),
             sessions: std::sync::Mutex::new(HashMap::new()),
             tokens: std::sync::Mutex::new(HashMap::new()),
+            typing_active: std::sync::Mutex::new(HashSet::new()),
+            typing_waiting: std::sync::Mutex::new(HashSet::new()),
             scrub_gen: AtomicU64::new(0),
             consent_post_lock: Mutex::new(()),
             bot_id: OnceLock::new(),
@@ -175,6 +181,19 @@ impl Shared {
 
     pub async fn behavior_for(&self, scope: &str) -> Behavior {
         self.behaviors.read().await.get(scope).cloned().unwrap_or_default()
+    }
+
+    /// Channels that should show a typing indicator right now: a turn is
+    /// running and it is not just parked listening.
+    pub fn channels_inferring(&self) -> Vec<String> {
+        let waiting = self.typing_waiting.lock().unwrap();
+        self.typing_active
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| !waiting.contains(*c))
+            .cloned()
+            .collect()
     }
 
     // ---- session tokens ----

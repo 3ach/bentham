@@ -256,6 +256,7 @@ async fn channel_turn(
         .kill_on_drop(true);
 
     tracing::info!(channel = target.name, scope = target.scope, fresh, first_time, "waking claude");
+    shared.typing_active.lock().unwrap().insert(channel_id.clone());
     let started = Instant::now();
     let ok = match cmd.spawn() {
         Err(e) => {
@@ -318,6 +319,7 @@ async fn channel_turn(
             }
         },
     };
+    shared.typing_active.lock().unwrap().remove(channel_id);
     shared.drop_token(&token);
 
     if ok {

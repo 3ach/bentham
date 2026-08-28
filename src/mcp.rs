@@ -99,9 +99,23 @@ fn own_channel(ctx: &TurnCtx) -> Result<ChannelId, String> {
 
 // ---------- tools ----------
 
+/// Unmarks "parked in wait" even if the request future is dropped mid-poll.
+struct WaitGuard {
+    s: Arc<Shared>,
+    ch: String,
+}
+
+impl Drop for WaitGuard {
+    fn drop(&mut self) {
+        self.s.typing_waiting.lock().unwrap().remove(&self.ch);
+    }
+}
+
 async fn wait_for_messages(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
     let secs = args["timeout_seconds"].as_u64().unwrap_or(240).clamp(5, 480);
     let deadline = Instant::now() + Duration::from_secs(secs);
+    s.typing_waiting.lock().unwrap().insert(ctx.channel_id.clone());
+    let _guard = WaitGuard { s: s.clone(), ch: ctx.channel_id.clone() };
     loop {
         // Register for wakeups *before* checking, so nothing slips between.
         let notified = s.notify.notified();
