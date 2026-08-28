@@ -39,7 +39,7 @@ pub struct Behavior {
     /// Channel IDs to watch within this scope; empty = all. DMs are always watched.
     #[serde(default)]
     pub watched_channels: Vec<String>,
-    /// "mentions" = wake only for @mentions and DMs; "all" = wake for any opted-in human message.
+    /// "all" = wake for any opted-in human message (default); "mentions" = only @mentions and DMs.
     #[serde(default = "d_respond_to")]
     pub respond_to: String,
     /// Wake on a timer even with no activity. 0 = disabled.
@@ -47,7 +47,7 @@ pub struct Behavior {
     pub idle_wake_minutes: u64,
 }
 
-fn d_respond_to() -> String { "mentions".into() }
+fn d_respond_to() -> String { "all".into() }
 
 impl Default for Behavior {
     fn default() -> Self {

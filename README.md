@@ -101,10 +101,10 @@ to be adjusted by the bot itself — or by you, by talking to it.
 
 ## Cost notes
 
-- `respond_to = "mentions"` (the default) is the sane mode: non-mention
-  chatter buffers silently as context and only an @mention/DM spends tokens.
-  The bot can switch itself to `"all"` — tell it to knock it off if that gets
-  expensive.
+- `respond_to = "all"` (the default) wakes him for any opted-in person's
+  message. Consent gating already bounds who can spend his tokens; if a server
+  gets expensive anyway, tell him (or set) `"mentions"` there — then only
+  @mentions and DMs wake him, everything else buffering as context.
 - Each wake is a `claude -p --resume` turn on the configured model
   (default `sonnet`).
 
