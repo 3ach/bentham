@@ -1,4 +1,4 @@
-//! Gateway ingest. The consent gates live in `message()`: a message either
+//! Gateway ingest. The consent filter lives in `message()`: a message either
 //! passes both and enters the buffer verbatim, or the handler returns and it
 //! never exists anywhere in this program.
 
@@ -15,30 +15,30 @@ struct Handler {
 }
 
 #[derive(Debug, PartialEq)]
-enum Gate {
+enum Verdict {
     Drop,
     /// An opted-in @mention in a dormant channel: activate it, then accept.
     SummonAccept,
     Accept,
 }
 
-/// Pure form of message()'s two guild consent gates (DMs never get here).
-/// Gate 1: dormant channels are invisible until an opted-in person @mentions
-/// the bot there. Gate 2: non-opted humans are dropped — their messages,
+/// Pure form of message()'s two guild consent rules (DMs never get here).
+/// Rule 1: dormant channels are invisible until an opted-in person @mentions
+/// the bot there. Rule 2: non-opted humans are dropped — their messages,
 /// including @mentions, never reach the buffer or inference. Other bots pass
 /// (no privacy interest; they never cause wakes).
-fn ingest_gate(
+fn consent_filter(
     mentions_me: bool,
     author_is_bot: bool,
     channel_active: bool,
     author_opted: bool,
-) -> Gate {
+) -> Verdict {
     if !channel_active {
-        if mentions_me && author_opted { Gate::SummonAccept } else { Gate::Drop }
+        if mentions_me && author_opted { Verdict::SummonAccept } else { Verdict::Drop }
     } else if author_is_bot || author_opted {
-        Gate::Accept
+        Verdict::Accept
     } else {
-        Gate::Drop
+        Verdict::Drop
     }
 }
 
@@ -67,23 +67,23 @@ impl EventHandler for Handler {
                 let g = consent::guild(&self.shared, &gid).await;
                 let opted = g.opted_users.contains_key(&author_id);
                 let active = g.active_channels.contains(&channel_id);
-                let gate = ingest_gate(mentions_me, msg.author.bot, active, opted);
+                let verdict = consent_filter(mentions_me, msg.author.bot, active, opted);
                 // Backstop; the post is normally created on guild join. Runs
-                // before gate 2, so any message in an inhabited channel —
+                // before rule 2, so any message in an inhabited channel —
                 // even one about to be dropped — can restore a lost post.
-                if active || gate != Gate::Drop {
+                if active || verdict != Verdict::Drop {
                     consent::ensure_post(&self.shared, &gid, msg.channel_id).await;
                 }
-                match gate {
-                    Gate::Drop => return,
-                    Gate::SummonAccept => {
+                match verdict {
+                    Verdict::Drop => return,
+                    Verdict::SummonAccept => {
                         let mut c = self.shared.consent.write().await;
                         c.guilds.entry(gid.clone()).or_default().active_channels.insert(channel_id.clone());
                         drop(c);
                         consent::save(&self.shared).await;
                         tracing::info!(channel = channel_id, guild = gid, "summoned into new channel");
                     }
-                    Gate::Accept => {}
+                    Verdict::Accept => {}
                 }
                 Scope::Guild(guild_id.get())
             }
@@ -199,11 +199,11 @@ pub async fn typing_pulse(s: Arc<Shared>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Gate, ingest_gate};
+    use super::{Verdict, consent_filter};
 
     #[test]
-    fn ingest_gate_table() {
-        use Gate::*;
+    fn consent_filter_table() {
+        use Verdict::*;
         // (mentions_me, author_is_bot, channel_active, author_opted, expect)
         let cases = [
             (false, false, false, false, Drop), // dormant, invisible
@@ -213,18 +213,18 @@ mod tests {
             (false, true, false, false, Drop),  // bots can't summon
             (false, true, false, true, Drop),
             (true, true, false, false, Drop),   // bot mention in dormant channel still dropped
-            (true, true, false, true, SummonAccept), // faithful: gate 1 checks opted only
+            (true, true, false, true, SummonAccept), // faithful: rule 1 checks opted only
             (false, false, true, false, Drop),  // active channel, non-opted human
             (true, false, true, false, Drop),   // non-opted mention is dropped
             (false, false, true, true, Accept),
             (true, false, true, true, Accept),
-            (false, true, true, false, Accept), // bots pass gate 2 (context only, never wake)
+            (false, true, true, false, Accept), // bots pass rule 2 (context only, never wake)
             (true, true, true, false, Accept),
             (false, true, true, true, Accept),
             (true, true, true, true, Accept),
         ];
         for (i, (mention, bot, active, opted, expect)) in cases.into_iter().enumerate() {
-            assert_eq!(ingest_gate(mention, bot, active, opted), expect, "case {i}");
+            assert_eq!(consent_filter(mention, bot, active, opted), expect, "case {i}");
         }
     }
 }
