@@ -16,6 +16,7 @@ const CONSENT_POST: &str = "\u{1F44B} I'm bentham, an AI presence on this server
 \u{2022} Remove your reaction any time to opt back out.\n\
 \u{2022} I only inhabit channels where an opted-in person @mentions me; everywhere else I see nothing \u{2014} including @mentions from people who haven't opted in.\n\
 \u{2022} Ask me to forget you and I'll scrub you from my memory here. Ask me to leave a channel and I'll go.\n\
+I simply never receive messages from anyone who hasn't opted in \u{2014} they aren't hidden from me, they never reach me at all.\n\
 What I learn on this server stays on this server.";
 
 fn consent_content() -> String {
@@ -25,9 +26,6 @@ fn consent_content() -> String {
         .unwrap_or(0);
     format!("{CONSENT_POST}\n\n-# last restart: <t:{ts}:f>")
 }
-
-pub const REDACTED: &str = "[redacted — this person hasn't opted in. They can opt in by \
-reacting to the consent post; do not speculate about what they said]";
 
 struct Handler {
     shared: Arc<Shared>,
@@ -51,9 +49,9 @@ impl EventHandler for Handler {
         let channel_id = msg.channel_id.to_string();
         let author_id = msg.author.id.to_string();
 
-        let (scope, redacted) = if is_dm {
+        let scope = if is_dm {
             // DMing bentham is consent; each DM is its own isolation scope.
-            (format!("dm-{channel_id}"), false)
+            format!("dm-{channel_id}")
         } else {
             let gid = msg.guild_id.map(|g| g.to_string()).unwrap_or_default();
             let (active, opted) = {
@@ -87,15 +85,16 @@ impl EventHandler for Handler {
             }
             // Backstop; the consent post is normally created on guild join.
             self.ensure_consent_post(&gid, msg.channel_id).await;
-            // Consent gate 2: non-opted humans get their content redacted at
-            // ingest (never stored) — even when they @mention bentham. Other
-            // bots have no privacy interest.
-            (gid, !msg.author.bot && !opted)
+            // Consent gate 2: non-opted humans are stripped at ingest — their
+            // messages (and their @mentions of bentham) simply never reach
+            // him. Other bots have no privacy interest.
+            if !msg.author.bot && !opted {
+                return;
+            }
+            gid
         };
 
-        let content = if redacted {
-            REDACTED.to_string()
-        } else {
+        let content = {
             let mut c = msg.content.clone();
             for a in &msg.attachments {
                 c.push_str(&format!("\n[attachment: {}]", a.url));
@@ -129,7 +128,6 @@ impl EventHandler for Handler {
                         .and_then(|r| r.message_id)
                         .map(|id| id.to_string())
                 }),
-            redacted,
             scope,
         };
         self.shared.push_event(ev).await;

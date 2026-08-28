@@ -25,9 +25,6 @@ pub struct MsgEvent {
     pub timestamp: String,
     pub mentions_me: bool,
     pub reply_to_message_id: Option<String>,
-    /// True when the author hasn't opted in: content was replaced at ingest
-    /// and never stored. Redacted messages never cause a wake.
-    pub redacted: bool,
     /// Isolation scope this event belongs to (guild id, or "dm-<channel>").
     #[serde(skip_serializing)]
     pub scope: String,
@@ -284,8 +281,8 @@ impl Shared {
         evs
     }
 
-    /// Channels with undelivered activity worth waking Claude for. Redacted
-    /// messages and other bots never wake (context only — avoids bot loops).
+    /// Channels with undelivered activity worth waking Claude for. Other
+    /// bots never wake (context only — avoids bot loops).
     pub async fn wakeworthy_channels(&self) -> Vec<WakeTarget> {
         let behs = self.behaviors.read().await.clone();
         let buf = self.buf.lock().await;
@@ -296,7 +293,6 @@ impl Shared {
             if e.seq > del.get(&e.channel_id).copied().unwrap_or(0)
                 && Self::watched(&beh, e)
                 && !e.author_is_bot
-                && !e.redacted
                 && (beh.respond_to == "all" || e.mentions_me || e.is_dm)
                 && !out.iter().any(|t| t.channel_id == e.channel_id)
             {

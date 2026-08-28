@@ -150,7 +150,8 @@ async fn read_messages(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<V
         .await
         .map_err(|e| format!("fetching messages: {e}"))?;
     let bot_id = s.bot_id.get().copied().unwrap_or(0);
-    // History gets the same consent redaction as live messages.
+    // History gets the same consent stripping as live messages: non-opted
+    // people's messages are absent, not blanked.
     let opted = s
         .consent
         .read()
@@ -163,19 +164,20 @@ async fn read_messages(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<V
     let list: Vec<Value> = msgs
         .iter()
         .rev()
-        .map(|m| {
-            let visible = ctx.is_dm
+        .filter(|m| {
+            ctx.is_dm
                 || m.author.bot
                 || m.author.id.get() == bot_id
-                || opted.contains_key(&m.author.id.to_string());
+                || opted.contains_key(&m.author.id.to_string())
+        })
+        .map(|m| {
             json!({
                 "message_id": m.id.to_string(),
                 "author_name": m.author.name,
                 "author_id": m.author.id.to_string(),
                 "author_is_bot": m.author.bot,
                 "is_me": m.author.id.get() == bot_id,
-                "content": if visible { m.content.clone() } else { crate::discord::REDACTED.to_string() },
-                "redacted": !visible,
+                "content": m.content,
                 "timestamp": m.timestamp.to_string(),
                 "reply_to_message_id": m.message_reference.as_ref()
                     .and_then(|r| r.message_id).map(|i| i.to_string()),
@@ -406,7 +408,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "read_messages",
-            "description": "Fetch recent message history for your channel (oldest first), with the same consent redaction as live messages.",
+            "description": "Fetch recent message history for your channel (oldest first). Only opted-in people's messages appear; anyone else's are absent entirely.",
             "inputSchema": { "type": "object", "required": ["token"], "properties": {
                 "token": tok.clone(),
                 "limit": { "type": "number", "description": "1-50, default 20." },

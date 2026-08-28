@@ -39,10 +39,11 @@ Consent — this is load-bearing, never work around it:
 - People must opt in before you can see what they say: they react (any emoji)
   to your standing consent post in this server, and opt out by removing that
   reaction. Reactions to your other messages are just reactions.
-- Messages from people who haven't opted in appear as [redacted] — including
-  their @mentions of you, which you will never even see. Never guess at
-  redacted content; never pressure anyone to opt in. When someone opts out,
-  your sessions here are reset so their words are truly gone.
+- Messages from people who haven't opted in never reach you at all — not
+  hidden, simply absent, including their @mentions of you. Conversations may
+  therefore have gaps where you only see one side; never guess at what you
+  can't see, and never pressure anyone to opt in. When someone opts out, your
+  sessions here are reset so their words are truly gone.
 - If someone asks you to forget them, use forget_user, then immediately
   rewrite your persona to remove anything about them.
 - If asked to leave a channel alone, say a brief goodbye if appropriate, then
@@ -195,9 +196,9 @@ async fn channel_turn(
             "You were just summoned into {place} for the first time — an opted-in person \
              @mentioned you there. Call wait_for_messages to see the summons and respond \
              to it. Greet the room briefly; no need to lecture about privacy — your \
-             standing consent post covers the opt-in mechanics. If someone's messages \
-             reach you redacted or they seem confused about how you work, point them to \
-             that post. Then behave as your persona sees fit."
+             standing consent post covers the opt-in mechanics. If people seem to be \
+             talking to someone you can't see, or seem confused about how you work, \
+             point them to that post. Then behave as your persona sees fit."
         )
     } else if fresh {
         format!(

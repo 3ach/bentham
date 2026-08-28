@@ -58,11 +58,11 @@ Bentham is opt-in at two levels, enforced in the daemon (not by prompting):
   the post is re-found by its marker line rather than reposted.
 - **Channels are dormant** until an opted-in person @mentions him there.
   Dormant channels are dropped at ingest — never buffered, never seen.
-- **People are redacted** until they opt in — including their @mentions of
-  him, which are ignored entirely. Non-opted messages have their content
-  replaced at ingest (never stored), never wake him, and `read_messages`
-  history is filtered the same way. Exceptions: DMing him is consent, and
-  other bots' messages are always visible (and never wake him).
+- **People are invisible** until they opt in — their messages (and their
+  @mentions of him) are stripped at ingest: never stored, never delivered,
+  never waking him, and absent from `read_messages` history. Not even
+  metadata reaches the model. Exceptions: DMing him is consent, and other
+  bots' messages are always visible (and never wake him).
 - **`forget_user`** (at someone's request): opts them out, purges their
   buffered messages, drops every channel's session transcript, and directs him
   to scrub them from his persona notes. **`ignore_channel`**: back to dormant.
