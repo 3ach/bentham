@@ -1,8 +1,9 @@
-use crate::state::{ConsentPost, MsgEvent, ScrubJob, Shared};
+use crate::state::{ConsentPost, MsgEvent, Shared};
+use std::collections::HashMap;
 use serde_json::json;
 use serenity::all::{
-    ChannelId, ChannelType, Context, EventHandler, GatewayIntents, Guild, Message, Reaction,
-    Ready, UserId,
+    ChannelId, ChannelType, Context, EventHandler, GatewayIntents, Guild, Message, MessageId,
+    Reaction, Ready, UserId,
 };
 use serenity::async_trait;
 use std::sync::Arc;
@@ -13,9 +14,9 @@ const CONSENT_MARKER: &str = "\u{1F44B} I'm bentham";
 
 const CONSENT_POST: &str = "\u{1F44B} I'm bentham, an AI presence on this server. How privacy works with me:\n\
 \u{2022} I can only read messages from people who **opt in** \u{2014} react to **this message** with any emoji to opt in.\n\
-\u{2022} Remove your reaction any time to opt back out.\n\
+\u{2022} Remove your reaction any time to opt out \u{2014} I then automatically forget you: my sessions reset and my notes about you are scrubbed.\n\
 \u{2022} I only inhabit channels where an opted-in person @mentions me; everywhere else I see nothing \u{2014} including @mentions from people who haven't opted in.\n\
-\u{2022} Ask me to forget you and I'll scrub you from my memory here. Ask me to leave a channel and I'll go.\n\
+\u{2022} Ask me to leave a channel and I'll go.\n\
 I simply never receive messages from anyone who hasn't opted in \u{2014} they aren't hidden from me, they never reach me at all.\n\
 What I learn on this server stays on this server.";
 
@@ -197,17 +198,9 @@ impl EventHandler for Handler {
                 Err(_) => user_id.to_string(),
             },
         };
-        self.shared
-            .consent
-            .write()
-            .await
-            .guilds
-            .entry(gid.clone())
-            .or_default()
-            .opted_users
-            .insert(user_id.to_string(), name.clone());
-        self.shared.save_consent().await;
-        tracing::info!(user = name, guild = gid, "opted in");
+        if self.shared.opt_in(&gid, &user_id.to_string(), &name).await {
+            tracing::info!(user = name, guild = gid, "opted in");
+        }
     }
 
     /// Removing a reaction from the consent post = opting back out.
@@ -221,25 +214,7 @@ impl EventHandler for Handler {
         if !self.is_consent_post(&gid, r.message_id.get()).await {
             return;
         }
-        // NB: bind first — an `if let` scrutinee keeps its temporaries (the
-        // write guard) alive through the success block, which would deadlock
-        // against save_consent's read lock.
-        let removed = {
-            let mut c = self.shared.consent.write().await;
-            c.guilds.entry(gid.clone()).or_default().opted_users.remove(&user_id.to_string())
-        };
-        if let Some(name) = removed {
-            self.shared.save_consent().await;
-            // Opting out burns this server's session transcripts and buffered
-            // messages, and queues a maintenance turn to scrub persona notes.
-            self.shared.drop_scope_sessions(&gid).await;
-            self.shared.purge_user(&gid, &user_id.to_string()).await;
-            self.shared.pending_scrubs.lock().unwrap().push(ScrubJob {
-                scope: gid.clone(),
-                user_id: user_id.to_string(),
-                user_name: name.clone(),
-            });
-            self.shared.notify.notify_waiters();
+        if let Some(name) = self.shared.opt_out(&gid, &user_id.to_string()).await {
             tracing::info!(user = name, guild = gid, "opted out; sessions dropped, scrub queued");
         }
     }
@@ -332,6 +307,74 @@ impl Handler {
             .or_default()
             .consent_post = Some(ConsentPost { channel_id: channel.to_string(), message_id });
         self.shared.save_consent().await;
+    }
+}
+
+/// The consent post's reactions are the source of truth. Poll them every few
+/// minutes and reconcile — this catches reactions added or removed while the
+/// daemon was down or an event was missed.
+pub async fn reconcile_consent(shared: Arc<Shared>) {
+    let bot_id = || shared.bot_id.get().copied().unwrap_or(0);
+    loop {
+        tokio::time::sleep(Duration::from_secs(180)).await;
+        let posts: Vec<(String, ConsentPost)> = shared
+            .consent
+            .read()
+            .await
+            .guilds
+            .iter()
+            .filter_map(|(g, gc)| gc.consent_post.clone().map(|p| (g.clone(), p)))
+            .collect();
+        for (gid, post) in posts {
+            let (Ok(ch), Ok(mid)) = (post.channel_id.parse::<u64>(), post.message_id.parse::<u64>())
+            else {
+                continue;
+            };
+            let (ch, mid) = (ChannelId::new(ch), MessageId::new(mid));
+            let msg = match shared.http.get_message(ch, mid).await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(guild = gid, "reconcile: can't fetch consent post: {e}");
+                    continue;
+                }
+            };
+            let mut reacted: HashMap<String, String> = HashMap::new();
+            for r in &msg.reactions {
+                match shared.http.get_reaction_users(ch, mid, &r.reaction_type, 100, None).await {
+                    Ok(users) => {
+                        for u in users {
+                            if !u.bot && u.id.get() != bot_id() {
+                                reacted.insert(u.id.to_string(), u.name.clone());
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(guild = gid, "reconcile: reaction fetch: {e}"),
+                }
+            }
+            for (uid, name) in &reacted {
+                if shared.opt_in(&gid, uid, name).await {
+                    tracing::info!(user = name, guild = gid, "opted in (reconciled)");
+                }
+            }
+            let (current, grandfathered) = {
+                let c = shared.consent.read().await;
+                match c.guilds.get(&gid) {
+                    Some(g) => (
+                        g.opted_users.keys().cloned().collect::<Vec<_>>(),
+                        g.grandfathered.clone(),
+                    ),
+                    None => (vec![], Default::default()),
+                }
+            };
+            for uid in current {
+                if !reacted.contains_key(&uid)
+                    && !grandfathered.contains(&uid)
+                    && let Some(name) = shared.opt_out(&gid, &uid).await
+                {
+                    tracing::info!(user = name, guild = gid, "opted out (reconciled)");
+                }
+            }
+        }
     }
 }
 

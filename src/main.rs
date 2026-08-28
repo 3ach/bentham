@@ -53,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Layer 2: Discord gateway feeding the message buffer.
     tokio::spawn(discord::run(token, shared.clone()));
+    tokio::spawn(discord::reconcile_consent(shared.clone()));
 
     // Typing indicator: pulse "bentham is typing…" wherever a turn is
     // actively inferring (Discord's indicator lasts ~10s; refresh under that).

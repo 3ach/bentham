@@ -71,6 +71,10 @@ pub struct GuildConsent {
     pub opted_users: HashMap<String, String>,
     #[serde(default)]
     pub consent_post: Option<ConsentPost>,
+    /// Users exempt from reconcile-based opt-out (opted in by the operator
+    /// without a reaction on record). A live un-react event still opts them out.
+    #[serde(default)]
+    pub grandfathered: HashSet<String>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -247,6 +251,50 @@ impl Shared {
         }
         self.scrub_gen.fetch_add(1, Ordering::SeqCst);
         self.save_sessions();
+    }
+
+    /// Register an opt-in (idempotent). Returns true if newly opted.
+    pub async fn opt_in(&self, gid: &str, user_id: &str, name: &str) -> bool {
+        let newly = {
+            let mut c = self.consent.write().await;
+            c.guilds
+                .entry(gid.to_string())
+                .or_default()
+                .opted_users
+                .insert(user_id.to_string(), name.to_string())
+                .is_none()
+        };
+        if newly {
+            self.save_consent().await;
+        }
+        newly
+    }
+
+    /// The full opt-out pipeline: consent removed, sessions burned, buffer
+    /// purged, persona scrub queued. Returns the name if they were opted in.
+    pub async fn opt_out(&self, gid: &str, user_id: &str) -> Option<String> {
+        let removed = {
+            let mut c = self.consent.write().await;
+            c.guilds.entry(gid.to_string()).or_default().opted_users.remove(user_id)
+        };
+        if let Some(name) = &removed {
+            self.save_consent().await;
+            self.drop_scope_sessions(gid).await;
+            self.purge_user(gid, user_id).await;
+            {
+                let mut q = self.pending_scrubs.lock().unwrap();
+                let job = ScrubJob {
+                    scope: gid.to_string(),
+                    user_id: user_id.to_string(),
+                    user_name: name.clone(),
+                };
+                if !q.contains(&job) {
+                    q.push(job);
+                }
+            }
+            self.notify.notify_waiters();
+        }
+        removed
     }
 
     // ---- message buffer ----

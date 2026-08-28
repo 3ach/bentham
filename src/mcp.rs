@@ -71,7 +71,6 @@ async fn call_tool(s: &Arc<Shared>, params: Value) -> Result<Value, (i64, String
             "get_behavior" => Ok(json!(s.behavior_for(&ctx.scope).await)),
             "set_behavior" => set_behavior(s, &ctx, &args).await,
             "get_consent" => get_consent(s, &ctx).await,
-            "forget_user" => forget_user(s, &ctx, &args).await,
             "ignore_channel" => ignore_channel(s, &ctx).await,
             _ => return Err((-32602, format!("unknown tool: {name}"))),
         },
@@ -279,45 +278,10 @@ async fn get_consent(s: &Arc<Shared>, ctx: &TurnCtx) -> Result<Value, String> {
     Ok(json!(s.consent.read().await.guilds.get(&ctx.scope).cloned().unwrap_or_default()))
 }
 
-/// Scrub a person from this server, at their request.
-async fn forget_user(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
-    if ctx.is_dm {
-        // Forgetting a DM partner = wiping the DM itself.
-        s.purge_channel(&ctx.channel_id).await;
-        s.drop_scope_sessions(&ctx.scope).await;
-        return Ok(json!({
-            "ok": true,
-            "note": "This DM's buffer and session are wiped. If your persona here mentions \
-                     them, rewrite it via set_persona (or leave it — it is scoped to this \
-                     DM only). End your turn now."
-        }));
-    }
-    let user_id = args["user_id"].as_str().ok_or("missing 'user_id'")?;
-    parse_id(user_id)?;
-    let name = {
-        let mut c = s.consent.write().await;
-        c.guilds.entry(ctx.scope.clone()).or_default().opted_users.remove(user_id)
-    };
-    s.save_consent().await;
-    s.purge_user(&ctx.scope, user_id).await;
-    s.drop_scope_sessions(&ctx.scope).await;
-    Ok(json!({
-        "ok": true,
-        "was_opted_in_as": name,
-        "note": "User forgotten on this server: opted out, their buffered messages purged, \
-                 and every session transcript here dropped (all channels start fresh next \
-                 wake). IMPORTANT: now call get_persona and remove anything about this \
-                 person via set_persona — that is the last place they could persist. Do \
-                 this before ending your turn."
-    }))
-}
-
 /// Return this session's channel to dormant.
 async fn ignore_channel(s: &Arc<Shared>, ctx: &TurnCtx) -> Result<Value, String> {
     if ctx.is_dm {
-        return Err("DMs can't be ignored — the person can simply stop writing, or ask you \
-                    to forget them (forget_user)"
-            .into());
+        return Err("DMs can't be ignored — the person can simply stop writing".into());
     }
     {
         let mut c = s.consent.write().await;
@@ -435,14 +399,6 @@ fn tool_defs() -> Value {
             "name": "get_consent",
             "description": "Read this server's consent state: inhabited channels, opted-in people, and the consent post.",
             "inputSchema": { "type": "object", "required": ["token"], "properties": { "token": tok.clone() } }
-        },
-        {
-            "name": "forget_user",
-            "description": "Scrub a person from this server's memory, at their request: opts them out, purges their buffered messages, and drops every session transcript here (all channels start fresh next wake). Afterwards you MUST remove any notes about them from your persona via set_persona.",
-            "inputSchema": { "type": "object", "required": ["token", "user_id"], "properties": {
-                "token": tok.clone(),
-                "user_id": { "type": "string", "description": "The Discord user id of the person asking to be forgotten." }
-            }}
         },
         {
             "name": "ignore_channel",
