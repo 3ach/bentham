@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use serenity::all::{ChannelId, ChannelType, MessageId, ReactionType};
+use serenity::all::{ChannelId, MessageId, ReactionType};
 use serenity::http::MessagePagination;
 use std::sync::Arc;
 use tokio::time::{Duration, Instant, sleep_until};
@@ -66,7 +66,6 @@ async fn call_tool(s: &Arc<Shared>, params: Value) -> Result<Value, (i64, String
             "read_messages" => read_messages(s, &ctx, &args).await,
             "send_message" => send_message(s, &ctx, &args).await,
             "add_reaction" => add_reaction(s, &ctx, &args).await,
-            "list_channels" => list_channels(s, &ctx).await,
             "get_persona" => Ok(json!({ "persona": persona::read_persona(s, &ctx.scope).await })),
             "set_persona" => set_persona(s, &ctx, &args).await,
             "get_behavior" => Ok(json!(s.behavior_for(&ctx.scope).await)),
@@ -226,41 +225,6 @@ async fn add_reaction(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Va
         .await
         .map_err(|e| format!("reacting: {e}"))?;
     Ok(json!({ "ok": true }))
-}
-
-async fn list_channels(s: &Arc<Shared>, ctx: &TurnCtx) -> Result<Value, String> {
-    if ctx.is_dm {
-        return Ok(json!({ "note": "this session is a DM — there is only this conversation" }));
-    }
-    let gid = serenity::all::GuildId::new(parse_id(&ctx.scope)?);
-    let chans = s
-        .http
-        .get_channels(gid)
-        .await
-        .map_err(|e| format!("listing channels: {e}"))?;
-    let active = s
-        .consent
-        .read()
-        .await
-        .guilds
-        .get(&ctx.scope)
-        .map(|g| g.active_channels.clone())
-        .unwrap_or_default();
-    let list: Vec<Value> = chans
-        .iter()
-        .filter(|c| matches!(c.kind, ChannelType::Text | ChannelType::News))
-        .map(|c| {
-            json!({
-                "channel_id": c.id.to_string(),
-                "name": c.name,
-                "you_inhabit": active.contains(&c.id.to_string()),
-            })
-        })
-        .collect();
-    Ok(json!({
-        "bot_user": { "id": s.bot_id.get().map(|i| i.to_string()), "name": s.bot_name.get() },
-        "channels": list,
-    }))
 }
 
 async fn set_persona(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
@@ -432,11 +396,6 @@ fn tool_defs() -> Value {
                 "message_id": { "type": "string" },
                 "emoji": { "type": "string" }
             }}
-        },
-        {
-            "name": "list_channels",
-            "description": "List this server's text channels (marking which you inhabit), plus your own bot identity.",
-            "inputSchema": { "type": "object", "required": ["token"], "properties": { "token": tok.clone() } }
         },
         {
             "name": "get_persona",
