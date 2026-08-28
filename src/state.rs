@@ -94,6 +94,16 @@ pub struct TurnCtx {
     pub channel_id: String,
     pub scope: String,
     pub is_dm: bool,
+    /// Maintenance turns (persona scrubs) may not speak.
+    pub maintenance: bool,
+}
+
+/// A queued persona scrub, triggered by an opt-out.
+#[derive(Clone, PartialEq)]
+pub struct ScrubJob {
+    pub scope: String,
+    pub user_id: String,
+    pub user_name: String,
 }
 
 /// A channel the dispatcher decided to wake.
@@ -114,6 +124,8 @@ pub struct Shared {
     pub sessions: std::sync::Mutex<HashMap<String, SessState>>,
     /// Live session tokens: the capability a turn presents to use the tools.
     tokens: std::sync::Mutex<HashMap<String, TurnCtx>>,
+    /// Persona scrubs waiting for a maintenance turn.
+    pub pending_scrubs: std::sync::Mutex<Vec<ScrubJob>>,
     /// Channels with a claude turn in flight / parked in wait_for_messages.
     /// Their difference = channels actively inferring (shown as typing).
     pub typing_active: std::sync::Mutex<HashSet<String>>,
@@ -141,6 +153,7 @@ impl Shared {
             consent: RwLock::new(Consent::default()),
             sessions: std::sync::Mutex::new(HashMap::new()),
             tokens: std::sync::Mutex::new(HashMap::new()),
+            pending_scrubs: std::sync::Mutex::new(Vec::new()),
             typing_active: std::sync::Mutex::new(HashSet::new()),
             typing_waiting: std::sync::Mutex::new(HashSet::new()),
             scrub_gen: AtomicU64::new(0),

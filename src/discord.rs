@@ -1,4 +1,4 @@
-use crate::state::{ConsentPost, MsgEvent, Shared};
+use crate::state::{ConsentPost, MsgEvent, ScrubJob, Shared};
 use serde_json::json;
 use serenity::all::{
     ChannelId, ChannelType, Context, EventHandler, GatewayIntents, Guild, Message, Reaction,
@@ -230,10 +230,17 @@ impl EventHandler for Handler {
         };
         if let Some(name) = removed {
             self.shared.save_consent().await;
-            // Opting out also burns this server's session transcripts, so
-            // their past messages don't linger in resumed context.
+            // Opting out burns this server's session transcripts and buffered
+            // messages, and queues a maintenance turn to scrub persona notes.
             self.shared.drop_scope_sessions(&gid).await;
-            tracing::info!(user = name, guild = gid, "opted out; sessions dropped");
+            self.shared.purge_user(&gid, &user_id.to_string()).await;
+            self.shared.pending_scrubs.lock().unwrap().push(ScrubJob {
+                scope: gid.clone(),
+                user_id: user_id.to_string(),
+                user_name: name.clone(),
+            });
+            self.shared.notify.notify_waiters();
+            tracing::info!(user = name, guild = gid, "opted out; sessions dropped, scrub queued");
         }
     }
 }

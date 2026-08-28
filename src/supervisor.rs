@@ -7,7 +7,7 @@
 //! binds every tool call to its channel and scope.
 
 use crate::persona;
-use crate::state::{Shared, TurnCtx, WakeTarget};
+use crate::state::{ScrubJob, Shared, TurnCtx, WakeTarget};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -64,10 +64,12 @@ Conduct:
 - Never respond to other bots. Never spam. Match the room's tone and pace.
 - Keep messages well under Discord's 2000-char limit."#;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum WakeKind {
     Activity,
     Idle,
+    /// Non-conversational persona scrub after an opt-out.
+    Scrub(ScrubJob),
 }
 
 pub async fn run(shared: Arc<Shared>) {
@@ -106,6 +108,36 @@ pub async fn run(shared: Arc<Shared>) {
         let notified = shared.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
+
+        // Queued persona scrubs run as maintenance turns in the consent
+        // post's channel slot.
+        let jobs: Vec<ScrubJob> = shared.pending_scrubs.lock().unwrap().drain(..).collect();
+        let mut requeue = Vec::new();
+        for job in jobs {
+            let chan = shared
+                .consent
+                .read()
+                .await
+                .guilds
+                .get(&job.scope)
+                .and_then(|g| g.consent_post.as_ref())
+                .map(|p| p.channel_id.clone());
+            let Some(chan) = chan else { continue };
+            if busy.lock().unwrap().insert(chan.clone()) {
+                let target = WakeTarget {
+                    channel_id: chan,
+                    name: format!("maintenance ({})", job.scope),
+                    is_dm: false,
+                    scope: job.scope.clone(),
+                };
+                spawn_turn(&shared, &busy, &data_dir, &mcp_cfg_path, target, WakeKind::Scrub(job));
+            } else {
+                requeue.push(job);
+            }
+        }
+        if !requeue.is_empty() {
+            shared.pending_scrubs.lock().unwrap().extend(requeue);
+        }
 
         let ready: Vec<WakeTarget> = {
             let busy_now = busy.lock().unwrap().clone();
@@ -191,7 +223,17 @@ async fn channel_turn(
     let persona_txt = persona::read_persona(shared, &target.scope).await;
     let sys = format!("{BASE_PROMPT}\n\n# Your persona (this server only)\n\n{persona_txt}");
     let place = format!("{} (channel_id {channel_id})", target.name);
-    let body = if first_time && !target.is_dm {
+    let body = if let WakeKind::Scrub(job) = &kind {
+        format!(
+            "Maintenance wake — this is not a conversation, and messaging is disabled. \
+             {} (user id {}) has opted out of visibility on this server. Call get_persona, \
+             then rewrite it with set_persona so it contains NO name, notes, quotes, or \
+             identifying references to them — not even speculation about who they might \
+             be. A neutral line like 'someone opted out; gaps may exist' is fine. \
+             set_persona resetting this server's sessions is expected. Then end your turn.",
+            job.user_name, job.user_id
+        )
+    } else if first_time && !target.is_dm {
         format!(
             "You were just summoned into {place} for the first time — an opted-in person \
              @mentioned you there. Call wait_for_messages to see the summons and respond \
@@ -225,6 +267,7 @@ async fn channel_turn(
         channel_id: channel_id.clone(),
         scope: target.scope.clone(),
         is_dm: target.is_dm,
+        maintenance: matches!(kind, WakeKind::Scrub(_)),
     });
     let prompt = format!("{body}\n\nYour session token (pass as 'token' on every tool call): {token}");
 

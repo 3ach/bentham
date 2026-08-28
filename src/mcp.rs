@@ -187,6 +187,9 @@ async fn read_messages(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<V
 }
 
 async fn send_message(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
+    if ctx.maintenance {
+        return Err("this is a maintenance turn — messaging is disabled".into());
+    }
     let channel = own_channel(ctx)?;
     let content = args["content"]
         .as_str()
@@ -213,6 +216,9 @@ async fn send_message(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Va
 }
 
 async fn add_reaction(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
+    if ctx.maintenance {
+        return Err("this is a maintenance turn — messaging is disabled".into());
+    }
     let channel = own_channel(ctx)?;
     let msg = MessageId::new(parse_id(
         args["message_id"].as_str().ok_or("missing 'message_id'")?,
