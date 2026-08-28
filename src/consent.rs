@@ -2,7 +2,7 @@
 //! of truth: react = opt in, un-react = opt out. Opting out triggers the full
 //! scrub pipeline. Nothing in this file is shared across servers.
 
-use crate::state::{ScrubJob, Shared};
+use crate::state::{Scope, ScrubJob, Shared, atomic_write};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serenity::all::{ChannelId, ChannelType, Guild, MessageId};
@@ -52,7 +52,9 @@ pub async fn load(shared: &Shared) -> anyhow::Result<()> {
 pub async fn save(shared: &Shared) {
     let c = shared.consent.read().await.clone();
     let text = serde_json::to_string_pretty(&c).unwrap_or_default();
-    let _ = tokio::fs::write(shared.consent_path(), text).await;
+    if let Err(e) = atomic_write(&shared.consent_path(), &text) {
+        tracing::warn!("writing consent.json: {e}");
+    }
 }
 
 pub async fn guild(shared: &Shared, gid: &str) -> GuildConsent {
@@ -80,25 +82,21 @@ pub async fn opt_in(shared: &Shared, gid: &str, user_id: &str, name: &str) -> bo
 /// transcripts dropped, their buffered messages purged, and a persona scrub
 /// queued (supervisor.rs runs it). Returns their name if they were opted in.
 pub async fn opt_out(shared: &Shared, gid: &str, user_id: &str) -> Option<String> {
+    // gids come from GuildId::to_string(), so this can't realistically fail.
+    let scope: Scope = gid.parse().ok()?;
     let removed = {
         let mut c = shared.consent.write().await;
         c.guilds.entry(gid.to_string()).or_default().opted_users.remove(user_id)
     };
     let name = removed?;
     save(shared).await;
-    shared.drop_scope_sessions(gid).await;
-    shared.buffer.purge_user(gid, user_id).await;
-    {
-        let mut q = shared.pending_scrubs.lock().unwrap();
-        let job = ScrubJob {
-            scope: gid.to_string(),
-            user_id: user_id.to_string(),
-            user_name: name.clone(),
-        };
-        if !q.contains(&job) {
-            q.push(job);
-        }
-    }
+    shared.drop_scope_sessions(scope).await;
+    shared.buffer.purge_user(scope, user_id);
+    shared.sessions.queue_scrub(ScrubJob {
+        scope,
+        user_id: user_id.to_string(),
+        user_name: name.clone(),
+    });
     shared.notify.notify_waiters();
     Some(name)
 }
@@ -110,6 +108,7 @@ const MARKER: &str = "\u{1F44B} I'm bentham";
 
 const POST: &str = "\u{1F44B} I'm bentham, an AI presence on this server. How privacy works with me:\n\
 \u{2022} I can only read messages from people who **opt in** \u{2014} react to **this message** with any emoji to opt in.\n\
+\u{2022} Opting in is retroactive \u{2014} it also lets me read your earlier messages in the channels I inhabit (ordinary Discord history).\n\
 \u{2022} Remove your reaction any time to opt out \u{2014} I then automatically forget you: my sessions reset and my notes about you are scrubbed.\n\
 \u{2022} I only inhabit channels where an opted-in person @mentions me; everywhere else I see nothing \u{2014} including @mentions from people who haven't opted in.\n\
 \u{2022} Ask me to leave a channel and I'll go.\n\
@@ -205,11 +204,10 @@ pub async fn ensure_post(shared: &Shared, gid: &str, fallback: ChannelId) {
             .unwrap_or(fallback),
         Err(_) => fallback,
     };
-    let bot_id = shared.bot_id.get().copied().unwrap_or(0);
     if let Ok(msgs) = shared.http.get_messages(target, None, Some(50)).await
         && let Some(m) = msgs
             .iter()
-            .find(|m| m.author.id.get() == bot_id && m.content.starts_with(MARKER))
+            .find(|m| shared.me() == Some(m.author.id.get()) && m.content.starts_with(MARKER))
     {
         let _ = shared
             .http
@@ -255,13 +253,12 @@ pub async fn reconcile(shared: std::sync::Arc<Shared>) {
                     continue;
                 }
             };
-            let bot_id = shared.bot_id.get().copied().unwrap_or(0);
             let mut reacted: HashMap<String, String> = HashMap::new();
             for r in &msg.reactions {
                 match shared.http.get_reaction_users(ch, mid, &r.reaction_type, 100, None).await {
                     Ok(users) => {
                         for u in users {
-                            if !u.bot && u.id.get() != bot_id {
+                            if !u.bot && shared.me() != Some(u.id.get()) {
                                 reacted.insert(u.id.to_string(), u.name.clone());
                             }
                         }

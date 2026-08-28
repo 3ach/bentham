@@ -2,8 +2,10 @@
 //! which resolves to one channel in one scope — there is no argument that
 //! reaches another channel, server, or persona.
 
+use crate::persona::RespondTo;
 use crate::state::{Shared, TurnCtx};
 use crate::{consent, persona};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use serenity::all::{ChannelId, MessageId, ReactionType};
 use serenity::http::MessagePagination;
@@ -27,6 +29,24 @@ impl From<&str> for Error {
     }
 }
 
+/// Typed view of a tool's args (each struct sits above its tool fn). The
+/// token is handled in dispatch; serde ignores it as an unknown field.
+fn parse_args<T: serde::de::DeserializeOwned>(tool: &str, args: &Value) -> Result<T, String> {
+    serde_json::from_value(args.clone()).map_err(|e| format!("bad {tool} arguments: {e}"))
+}
+
+/// Models send "number" params as 240.0 or "240" often enough; take those,
+/// and let anything else fall back to the param's default rather than error.
+fn lenient_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::Number(n) => {
+            n.as_u64().or_else(|| n.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0).map(|f| f as u64))
+        }
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    })
+}
+
 pub async fn dispatch(s: &Arc<Shared>, name: &str, args: &Value) -> Result<Value, Error> {
     let token = args["token"]
         .as_str()
@@ -37,9 +57,9 @@ pub async fn dispatch(s: &Arc<Shared>, name: &str, args: &Value) -> Result<Value
         "read_messages" => read_messages(s, &ctx, args).await,
         "send_message" => send_message(s, &ctx, args).await,
         "add_reaction" => add_reaction(s, &ctx, args).await,
-        "get_persona" => Ok(json!({ "persona": persona::read(s, &ctx.scope).await })),
+        "get_persona" => Ok(json!({ "persona": persona::read(s, ctx.scope).await })),
         "set_persona" => set_persona(s, &ctx, args).await,
-        "get_behavior" => Ok(json!(persona::behavior_for(s, &ctx.scope).await)),
+        "get_behavior" => Ok(json!(persona::behavior_for(s, ctx.scope).await)),
         "set_behavior" => set_behavior(s, &ctx, args).await,
         "get_consent" => get_consent(s, &ctx).await,
         "ignore_channel" => ignore_channel(s, &ctx).await,
@@ -60,8 +80,15 @@ impl Drop for WaitGuard {
     }
 }
 
+#[derive(Deserialize)]
+struct WaitForMessagesArgs {
+    #[serde(default, deserialize_with = "lenient_u64")]
+    timeout_seconds: Option<u64>,
+}
+
 async fn wait_for_messages(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
-    let secs = args["timeout_seconds"].as_u64().unwrap_or(240).clamp(5, 480);
+    let a: WaitForMessagesArgs = parse_args("wait_for_messages", args)?;
+    let secs = a.timeout_seconds.unwrap_or(240).clamp(5, 480);
     let deadline = Instant::now() + Duration::from_secs(secs);
     s.typing.wait_started(&ctx.channel_id);
     let _guard = WaitGuard { s: s.clone(), ch: ctx.channel_id.clone() };
@@ -70,7 +97,7 @@ async fn wait_for_messages(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Resu
         let notified = s.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let evs = s.buffer.take_undelivered(&ctx.channel_id).await;
+        let evs = s.buffer.take_undelivered(&ctx.channel_id);
         if !evs.is_empty() {
             return Ok(json!({ "messages": evs }));
         }
@@ -86,10 +113,18 @@ async fn wait_for_messages(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Resu
     }
 }
 
+#[derive(Deserialize)]
+struct ReadMessagesArgs {
+    #[serde(default, deserialize_with = "lenient_u64")]
+    limit: Option<u64>,
+    before_message_id: Option<String>,
+}
+
 async fn read_messages(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
+    let a: ReadMessagesArgs = parse_args("read_messages", args)?;
     let channel = own_channel(ctx)?;
-    let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as u8;
-    let before = match args["before_message_id"].as_str() {
+    let limit = a.limit.unwrap_or(20).clamp(1, 50) as u8;
+    let before = match a.before_message_id.as_deref() {
         Some(m) => Some(MessagePagination::Before(MessageId::new(parse_id(m)?))),
         None => None,
     };
@@ -98,10 +133,11 @@ async fn read_messages(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<V
         .get_messages(channel, before, Some(limit))
         .await
         .map_err(|e| format!("fetching messages: {e}"))?;
-    let bot_id = s.bot_id.get().copied().unwrap_or(0);
+    let me = s.me();
     // History gets the same consent gate as live messages: non-opted people's
-    // messages are absent, not blanked.
-    let opted = consent::guild(s, &ctx.scope).await.opted_users;
+    // messages are absent, not blanked. (For DMs the guild lookup misses and
+    // yields defaults, same as the "dm-..." key would.)
+    let opted = consent::guild(s, &ctx.scope.to_string()).await.opted_users;
     // Discord returns newest-first; flip to reading order.
     let list: Vec<Value> = msgs
         .iter()
@@ -109,7 +145,7 @@ async fn read_messages(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<V
         .filter(|m| {
             ctx.is_dm
                 || m.author.bot
-                || m.author.id.get() == bot_id
+                || me == Some(m.author.id.get())
                 || opted.contains_key(&m.author.id.to_string())
         })
         .map(|m| {
@@ -118,7 +154,7 @@ async fn read_messages(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<V
                 "author_name": m.author.name,
                 "author_id": m.author.id.to_string(),
                 "author_is_bot": m.author.bot,
-                "is_me": m.author.id.get() == bot_id,
+                "is_me": me == Some(m.author.id.get()),
                 "content": m.content,
                 "timestamp": m.timestamp.to_string(),
                 "reply_to_message_id": m.message_reference.as_ref()
@@ -129,21 +165,26 @@ async fn read_messages(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<V
     Ok(json!({ "messages": list }))
 }
 
+#[derive(Deserialize)]
+struct SendMessageArgs {
+    content: String,
+    reply_to_message_id: Option<String>,
+}
+
 async fn send_message(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
     if ctx.maintenance {
         return Err("this is a maintenance turn — messaging is disabled".into());
     }
     let channel = own_channel(ctx)?;
-    let content = args["content"]
-        .as_str()
-        .filter(|c| !c.trim().is_empty())
-        .ok_or("missing or empty 'content'")?;
-    let reply_to = args["reply_to_message_id"].as_str();
+    let a: SendMessageArgs = parse_args("send_message", args)?;
+    if a.content.trim().is_empty() {
+        return Err("missing or empty 'content'".into());
+    }
     let mut ids = Vec::new();
-    for (i, chunk) in split_chunks(content, 2000).iter().enumerate() {
+    for (i, chunk) in split_chunks(&a.content, 2000).iter().enumerate() {
         let mut payload = json!({ "content": chunk });
         if i == 0
-            && let Some(r) = reply_to
+            && let Some(r) = a.reply_to_message_id.as_deref()
         {
             payload["message_reference"] =
                 json!({ "channel_id": channel.to_string(), "message_id": r });
@@ -158,14 +199,21 @@ async fn send_message(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Va
     Ok(json!({ "sent_message_ids": ids }))
 }
 
+#[derive(Deserialize)]
+struct AddReactionArgs {
+    message_id: String,
+    emoji: String,
+}
+
 async fn add_reaction(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
     if ctx.maintenance {
         return Err("this is a maintenance turn — messaging is disabled".into());
     }
     let channel = own_channel(ctx)?;
-    let msg = MessageId::new(parse_id(args["message_id"].as_str().ok_or("missing 'message_id'")?)?);
-    let emoji = args["emoji"].as_str().ok_or("missing 'emoji'")?;
-    let reaction = ReactionType::try_from(emoji).map_err(|e| format!("bad emoji {emoji:?}: {e}"))?;
+    let a: AddReactionArgs = parse_args("add_reaction", args)?;
+    let msg = MessageId::new(parse_id(&a.message_id)?);
+    let reaction =
+        ReactionType::try_from(a.emoji.as_str()).map_err(|e| format!("bad emoji {:?}: {e}", a.emoji))?;
     s.http
         .create_reaction(channel, msg, &reaction)
         .await
@@ -173,14 +221,19 @@ async fn add_reaction(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Va
     Ok(json!({ "ok": true }))
 }
 
+#[derive(Deserialize)]
+struct SetPersonaArgs {
+    content: String,
+}
+
 async fn set_persona(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
-    let content = args["content"]
-        .as_str()
-        .filter(|c| !c.trim().is_empty())
-        .ok_or("missing or empty 'content' — set_persona replaces the whole file")?;
-    persona::write(s, &ctx.scope, content).await?;
+    let a: SetPersonaArgs = parse_args("set_persona", args)?;
+    if a.content.trim().is_empty() {
+        return Err("missing or empty 'content' — set_persona replaces the whole file".into());
+    }
+    persona::write(s, ctx.scope, &a.content).await?;
     // A new persona means a new mind: transcripts made under the old one die.
-    s.drop_scope_sessions(&ctx.scope).await;
+    s.drop_scope_sessions(ctx.scope).await;
     Ok(json!({
         "ok": true,
         "note": "persona saved. All sessions in this scope (including this one) reset: next \
@@ -189,24 +242,31 @@ async fn set_persona(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Val
     }))
 }
 
+#[derive(Deserialize)]
+struct SetBehaviorArgs {
+    watched_channels: Option<Vec<String>>,
+    respond_to: Option<String>,
+    #[serde(default, deserialize_with = "lenient_u64")]
+    idle_wake_minutes: Option<u64>,
+}
+
 async fn set_behavior(s: &Arc<Shared>, ctx: &TurnCtx, args: &Value) -> Result<Value, String> {
-    let mut beh = persona::behavior_for(s, &ctx.scope).await;
-    if let Some(w) = args.get("watched_channels").and_then(Value::as_array) {
-        beh.watched_channels = w
-            .iter()
-            .map(|v| v.as_str().map(String::from).ok_or("watched_channels must be strings"))
-            .collect::<Result<_, _>>()?;
+    let a: SetBehaviorArgs = parse_args("set_behavior", args)?;
+    let mut beh = persona::behavior_for(s, ctx.scope).await;
+    if let Some(w) = a.watched_channels {
+        beh.watched_channels = w;
     }
-    if let Some(r) = args.get("respond_to").and_then(Value::as_str) {
-        if r != "mentions" && r != "all" {
-            return Err("respond_to must be \"mentions\" or \"all\"".into());
-        }
-        beh.respond_to = r.to_string();
+    if let Some(r) = a.respond_to {
+        beh.respond_to = match r.as_str() {
+            "all" => RespondTo::All,
+            "mentions" => RespondTo::Mentions,
+            _ => return Err("respond_to must be \"mentions\" or \"all\"".into()),
+        };
     }
-    if let Some(m) = args.get("idle_wake_minutes").and_then(Value::as_u64) {
+    if let Some(m) = a.idle_wake_minutes {
         beh.idle_wake_minutes = m;
     }
-    s.behaviors.write().await.insert(ctx.scope.clone(), beh.clone());
+    s.behaviors.write().await.insert(ctx.scope, beh.clone());
     persona::save_behaviors(s).await;
     Ok(json!({ "ok": true, "behavior": beh, "note": "in effect immediately, this scope only" }))
 }
@@ -215,7 +275,7 @@ async fn get_consent(s: &Arc<Shared>, ctx: &TurnCtx) -> Result<Value, String> {
     if ctx.is_dm {
         return Ok(json!({ "note": "DMs are consent by definition; no registry here" }));
     }
-    Ok(json!(consent::guild(s, &ctx.scope).await))
+    Ok(json!(consent::guild(s, &ctx.scope.to_string()).await))
 }
 
 /// Return this session's channel to dormant.
@@ -225,13 +285,15 @@ async fn ignore_channel(s: &Arc<Shared>, ctx: &TurnCtx) -> Result<Value, String>
     }
     {
         let mut c = s.consent.write().await;
-        c.guilds.entry(ctx.scope.clone()).or_default().active_channels.remove(&ctx.channel_id);
+        c.guilds.entry(ctx.scope.to_string()).or_default().active_channels.remove(&ctx.channel_id);
     }
     consent::save(s).await;
-    s.buffer.purge_channel(&ctx.channel_id).await;
-    s.sessions.lock().unwrap().remove(&ctx.channel_id);
-    s.scrub_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    s.buffer.purge_channel(&ctx.channel_id);
+    let dropped = s.sessions.drop_channel(&ctx.channel_id);
     s.save_sessions();
+    if let Some(old) = dropped {
+        s.reap_transcripts(&[old]);
+    }
     Ok(json!({
         "ok": true,
         "note": "This channel is dormant again: you will see nothing from it unless an \
@@ -348,4 +410,69 @@ pub fn definitions() -> Value {
             "inputSchema": { "type": "object", "required": ["token"], "properties": { "token": tok.clone() } }
         }
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_chunks_empty() {
+        // send_message's non-empty check depends on this not producing [""].
+        assert!(split_chunks("", 2000).is_empty());
+    }
+
+    #[test]
+    fn split_chunks_exact_boundary() {
+        let s = "a".repeat(2000);
+        assert_eq!(split_chunks(&s, 2000), vec![s.clone()]);
+        let s = "a".repeat(2001);
+        let lens: Vec<usize> =
+            split_chunks(&s, 2000).iter().map(|c| c.chars().count()).collect();
+        assert_eq!(lens, vec![2000, 1]);
+    }
+
+    #[test]
+    fn split_chunks_newline_preferred() {
+        let s = format!("{}\n{}", "a".repeat(1500), "b".repeat(1000));
+        let chunks = split_chunks(&s, 2000);
+        // Break after the newline, not at 2000.
+        assert_eq!(chunks, vec![format!("{}\n", "a".repeat(1500)), "b".repeat(1000)]);
+    }
+
+    #[test]
+    fn split_chunks_leading_newline_guard() {
+        let s = format!("\n{}", "a".repeat(2500));
+        let chunks = split_chunks(&s, 2000);
+        assert!(chunks.iter().all(|c| !c.is_empty()));
+        // Cut at the cap, not at the position-0 newline the guard excludes.
+        assert_eq!(chunks[0].chars().count(), 2000);
+        assert_eq!(chunks.concat(), s);
+    }
+
+    #[test]
+    fn split_chunks_newline_only_in_first_window() {
+        // A newline past position 2000 must not shape the first cut.
+        let s = format!("{}\n{}", "a".repeat(2100), "b".repeat(50));
+        let chunks = split_chunks(&s, 2000);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], "a".repeat(2000));
+        assert_eq!(chunks.concat(), s);
+    }
+
+    #[test]
+    fn split_chunks_unicode() {
+        // 4-byte chars: counted in chars, not bytes (byte slicing would panic).
+        let s = "🦀".repeat(2100);
+        let chunks = split_chunks(&s, 2000);
+        let lens: Vec<usize> = chunks.iter().map(|c| c.chars().count()).collect();
+        assert_eq!(lens, vec![2000, 100]);
+        assert_eq!(chunks.concat(), s);
+        // Mixed accents/emoji straddling the boundary.
+        let s = format!("{}é🦀é", "x".repeat(1998));
+        let chunks = split_chunks(&s, 2000);
+        let lens: Vec<usize> = chunks.iter().map(|c| c.chars().count()).collect();
+        assert_eq!(lens, vec![2000, 1]);
+        assert_eq!(chunks.concat(), s);
+    }
 }

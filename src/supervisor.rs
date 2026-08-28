@@ -8,7 +8,6 @@ use crate::{consent, persona, prompts};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::process::Stdio;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 use tokio::time::{Duration, Instant, sleep, sleep_until, timeout};
@@ -35,7 +34,7 @@ pub async fn run(shared: Arc<Shared>) {
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
     {
-        *shared.sessions.lock().unwrap() = map;
+        shared.sessions.load(map);
     }
 
     let busy: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -49,10 +48,10 @@ pub async fn run(shared: Arc<Shared>) {
         notified.as_mut().enable();
 
         // Persona scrubs first; they borrow the consent post's channel slot.
-        let jobs: Vec<ScrubJob> = shared.pending_scrubs.lock().unwrap().drain(..).collect();
+        let jobs: Vec<ScrubJob> = shared.sessions.take_scrubs();
         let mut requeue = Vec::new();
         for job in jobs {
-            let Some(chan) = consent::post_of(&shared, &job.scope).await.map(|p| p.channel_id)
+            let Some(chan) = consent::post_of(&shared, &job.scope.to_string()).await.map(|p| p.channel_id)
             else {
                 continue;
             };
@@ -61,7 +60,7 @@ pub async fn run(shared: Arc<Shared>) {
                     channel_id: chan,
                     name: format!("maintenance ({})", job.scope),
                     is_dm: false,
-                    scope: job.scope.clone(),
+                    scope: job.scope,
                 };
                 spawn_turn(&shared, &busy, target, WakeKind::Scrub(job));
             } else {
@@ -69,7 +68,7 @@ pub async fn run(shared: Arc<Shared>) {
             }
         }
         if !requeue.is_empty() {
-            shared.pending_scrubs.lock().unwrap().extend(requeue);
+            shared.sessions.requeue_scrubs(requeue);
         }
 
         let ready: Vec<WakeTarget> = {
@@ -78,7 +77,6 @@ pub async fn run(shared: Arc<Shared>) {
             shared
                 .buffer
                 .wakeworthy(&behaviors)
-                .await
                 .into_iter()
                 .filter(|t| !busy_now.contains(&t.channel_id))
                 .collect()
@@ -89,7 +87,7 @@ pub async fn run(shared: Arc<Shared>) {
                 _ = notified => {}
                 _ = sleep_until(idle_deadline) => {
                     if let Some(t) = last_active.clone()
-                        && persona::behavior_for(&shared, &t.scope).await.idle_wake_minutes > 0
+                        && persona::behavior_for(&shared, t.scope).await.idle_wake_minutes > 0
                         && busy.lock().unwrap().insert(t.channel_id.clone())
                     {
                         spawn_turn(&shared, &busy, t, WakeKind::Idle);
@@ -111,7 +109,7 @@ pub async fn run(shared: Arc<Shared>) {
 
 async fn next_idle_deadline(shared: &Arc<Shared>, last: &Option<WakeTarget>) -> Instant {
     let minutes = match last {
-        Some(t) => persona::behavior_for(shared, &t.scope).await.idle_wake_minutes,
+        Some(t) => persona::behavior_for(shared, t.scope).await.idle_wake_minutes,
         None => 0,
     };
     let secs = if minutes > 0 { minutes * 60 } else { 365 * 24 * 3600 };
@@ -135,15 +133,11 @@ async fn turn(shared: &Arc<Shared>, target: &WakeTarget, kind: WakeKind) {
         sleep(Duration::from_secs(cfg.debounce_seconds)).await;
     }
 
-    let gen_at_start = shared.scrub_gen.load(Ordering::SeqCst);
     let channel_id = &target.channel_id;
-    let (st, first_time) = {
-        let map = shared.sessions.lock().unwrap();
-        (map.get(channel_id).cloned().unwrap_or_default(), !map.contains_key(channel_id))
-    };
+    let (st, first_time, gen_at_start) = shared.sessions.begin_turn(channel_id);
     let fresh = st.session_id.is_none() || st.wakes >= cfg.session_max_wakes;
 
-    let system = prompts::system(&persona::read(shared, &target.scope).await);
+    let system = prompts::system(&persona::read(shared, target.scope).await);
     let place = format!("{} (channel_id {channel_id})", target.name);
     let body = match &kind {
         WakeKind::Scrub(job) => prompts::scrub(&job.user_name, &job.user_id),
@@ -154,7 +148,7 @@ async fn turn(shared: &Arc<Shared>, target: &WakeTarget, kind: WakeKind) {
     };
     let token = shared.tokens.issue(TurnCtx {
         channel_id: channel_id.clone(),
-        scope: target.scope.clone(),
+        scope: target.scope,
         is_dm: target.is_dm,
         maintenance: matches!(kind, WakeKind::Scrub(_)),
     });
@@ -188,7 +182,7 @@ async fn turn(shared: &Arc<Shared>, target: &WakeTarget, kind: WakeKind) {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    tracing::info!(channel = target.name, scope = target.scope, fresh, first_time, "waking claude");
+    tracing::info!(channel = target.name, scope = %target.scope, fresh, first_time, "waking claude");
     shared.typing.turn_started(channel_id);
     let started = Instant::now();
     let outcome = run_claude(cmd, Duration::from_secs(cfg.turn_timeout_minutes * 60)).await;
@@ -212,38 +206,36 @@ async fn turn(shared: &Arc<Shared>, target: &WakeTarget, kind: WakeKind) {
                 res["result"].as_str().unwrap_or("").chars().take(300).collect::<String>()
             );
             // If a scrub invalidated memory mid-turn, this transcript dies with it.
-            if shared.scrub_gen.load(Ordering::SeqCst) != gen_at_start {
-                tracing::info!(channel = target.name, "scrub happened mid-turn; not recording session");
-            } else {
-                if let Some(id) = res["session_id"].as_str() {
-                    let mut map = shared.sessions.lock().unwrap();
-                    let e = map.entry(channel_id.clone()).or_default();
-                    e.session_id = Some(id.to_string());
-                    e.wakes = if fresh { 1 } else { e.wakes + 1 };
-                }
+            let (gen_ok, reapable) =
+                shared.sessions.record_session(channel_id, res["session_id"].as_str(), fresh, gen_at_start);
+            if gen_ok {
                 shared.save_sessions();
+            } else {
+                tracing::info!(channel = target.name, "scrub happened mid-turn; not recording session");
+            }
+            // Either the id displaced by a fresh turn, or the unrecorded
+            // post-scrub one; nothing references it, so it dies here.
+            if let Some(old) = reapable {
+                shared.reap_transcripts(&[old]);
             }
             !is_error
         }
     };
 
     if ok {
-        shared.sessions.lock().unwrap().entry(channel_id.clone()).or_default().failures = 0;
+        shared.sessions.clear_failures(channel_id);
     } else {
-        let failures = {
-            let mut map = shared.sessions.lock().unwrap();
-            let e = map.entry(channel_id.clone()).or_default();
-            e.failures += 1;
-            if e.failures >= 3 {
-                // The session may be poisoned — start this channel fresh next time.
-                tracing::warn!(channel = target.name, "3 consecutive failures, dropping session");
-                *e = Default::default();
-            }
-            e.failures
-        };
+        let (failures, dropped, old_id) = shared.sessions.record_failure(channel_id);
+        if dropped {
+            tracing::warn!(channel = target.name, "3 consecutive failures, dropping session");
+        }
         shared.save_sessions();
-        // Back off while still holding this channel's busy slot.
-        sleep(Duration::from_secs((2u64 << failures).min(60))).await;
+        if let Some(old) = old_id {
+            shared.reap_transcripts(&[old]);
+        }
+        // Back off while still holding this channel's busy slot: 4s, 8s,
+        // then 2s after the reset (`2 << failures` from the original code).
+        sleep(Duration::from_secs(2u64.saturating_pow(failures + 1).min(60))).await;
     }
 }
 

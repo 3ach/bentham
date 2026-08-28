@@ -69,20 +69,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(discord::run(token, shared.clone()));
     tokio::spawn(consent::reconcile(shared.clone()));
 
-    // Typing indicator: Discord's lasts ~10s; refresh under that while inferring.
-    {
-        let s = shared.clone();
-        tokio::spawn(async move {
-            loop {
-                for ch in s.typing.inferring() {
-                    if let Ok(id) = ch.parse::<u64>() {
-                        let _ = s.http.broadcast_typing(serenity::all::ChannelId::new(id)).await;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-            }
-        });
-    }
+    // Typing indicator refresh while inferring.
+    tokio::spawn(discord::typing_pulse(shared.clone()));
 
     // The session supervisor, until ctrl-c.
     tokio::select! {

@@ -4,7 +4,7 @@
 
 use crate::buffer::MsgEvent;
 use crate::consent;
-use crate::state::Shared;
+use crate::state::{Scope, Shared};
 use serenity::all::{Context, EventHandler, GatewayIntents, Guild, Message, Reaction, Ready, UserId};
 use serenity::async_trait;
 use std::sync::Arc;
@@ -12,6 +12,34 @@ use std::time::Duration;
 
 struct Handler {
     shared: Arc<Shared>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Gate {
+    Drop,
+    /// An opted-in @mention in a dormant channel: activate it, then accept.
+    SummonAccept,
+    Accept,
+}
+
+/// Pure form of message()'s two guild consent gates (DMs never get here).
+/// Gate 1: dormant channels are invisible until an opted-in person @mentions
+/// the bot there. Gate 2: non-opted humans are dropped — their messages,
+/// including @mentions, never reach the buffer or inference. Other bots pass
+/// (no privacy interest; they never cause wakes).
+fn ingest_gate(
+    mentions_me: bool,
+    author_is_bot: bool,
+    channel_active: bool,
+    author_opted: bool,
+) -> Gate {
+    if !channel_active {
+        if mentions_me && author_opted { Gate::SummonAccept } else { Gate::Drop }
+    } else if author_is_bot || author_opted {
+        Gate::Accept
+    } else {
+        Gate::Drop
+    }
 }
 
 #[async_trait]
@@ -23,42 +51,41 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
-        let bot_id = self.shared.bot_id.get().copied().unwrap_or(0);
-        if msg.author.id.get() == bot_id {
+        let me = self.shared.me();
+        if me == Some(msg.author.id.get()) {
             return;
         }
-        let mentions_me = bot_id != 0 && msg.mentions_user_id(UserId::new(bot_id));
+        let mentions_me = me.is_some_and(|id| msg.mentions_user_id(UserId::new(id)));
         let channel_id = msg.channel_id.to_string();
         let author_id = msg.author.id.to_string();
 
         let scope = match msg.guild_id {
             // DMing the bot is consent; each DM is its own isolation scope.
-            None => format!("dm-{channel_id}"),
+            None => Scope::Dm(msg.channel_id.get()),
             Some(guild_id) => {
                 let gid = guild_id.to_string();
                 let g = consent::guild(&self.shared, &gid).await;
                 let opted = g.opted_users.contains_key(&author_id);
-                // Gate 1: dormant channels are invisible until an opted-in
-                // person @mentions the bot there.
-                if !g.active_channels.contains(&channel_id) {
-                    if !(mentions_me && opted) {
-                        return;
+                let active = g.active_channels.contains(&channel_id);
+                let gate = ingest_gate(mentions_me, msg.author.bot, active, opted);
+                // Backstop; the post is normally created on guild join. Runs
+                // before gate 2, so any message in an inhabited channel —
+                // even one about to be dropped — can restore a lost post.
+                if active || gate != Gate::Drop {
+                    consent::ensure_post(&self.shared, &gid, msg.channel_id).await;
+                }
+                match gate {
+                    Gate::Drop => return,
+                    Gate::SummonAccept => {
+                        let mut c = self.shared.consent.write().await;
+                        c.guilds.entry(gid.clone()).or_default().active_channels.insert(channel_id.clone());
+                        drop(c);
+                        consent::save(&self.shared).await;
+                        tracing::info!(channel = channel_id, guild = gid, "summoned into new channel");
                     }
-                    let mut c = self.shared.consent.write().await;
-                    c.guilds.entry(gid.clone()).or_default().active_channels.insert(channel_id.clone());
-                    drop(c);
-                    consent::save(&self.shared).await;
-                    tracing::info!(channel = channel_id, guild = gid, "summoned into new channel");
+                    Gate::Accept => {}
                 }
-                // Backstop; the post is normally created on guild join.
-                consent::ensure_post(&self.shared, &gid, msg.channel_id).await;
-                // Gate 2: non-opted humans are dropped here — their messages,
-                // including @mentions, never reach the buffer or inference.
-                // Other bots pass (no privacy interest; they never cause wakes).
-                if !msg.author.bot && !opted {
-                    return;
-                }
-                gid
+                Scope::Guild(guild_id.get())
             }
         };
 
@@ -87,7 +114,7 @@ impl EventHandler for Handler {
                 .or_else(|| msg.message_reference.as_ref().and_then(|r| r.message_id).map(|i| i.to_string())),
             scope,
         };
-        self.shared.buffer.push(ev).await;
+        self.shared.buffer.push(ev);
         self.shared.notify.notify_waiters();
     }
 
@@ -123,9 +150,9 @@ impl Handler {
     /// Some(guild, user) iff this reaction is a non-bot user acting on the
     /// guild's consent post.
     async fn consent_post_reaction(&self, r: &Reaction) -> Option<(String, UserId)> {
-        let bot_id = self.shared.bot_id.get().copied().unwrap_or(0);
+        let me = self.shared.me()?;
         let (gid, user_id) = (r.guild_id?, r.user_id?);
-        if bot_id == 0 || user_id.get() == bot_id {
+        if user_id.get() == me {
             return None;
         }
         let gid = gid.to_string();
@@ -155,5 +182,49 @@ pub async fn run(token: String, shared: Arc<Shared>) {
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
         tracing::info!("restarting discord gateway");
+    }
+}
+
+/// Discord's typing indicator lasts ~10s; refresh under that while inferring.
+pub async fn typing_pulse(s: Arc<Shared>) {
+    loop {
+        for ch in s.typing.inferring() {
+            if let Ok(id) = ch.parse::<u64>() {
+                let _ = s.http.broadcast_typing(serenity::all::ChannelId::new(id)).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(8)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Gate, ingest_gate};
+
+    #[test]
+    fn ingest_gate_table() {
+        use Gate::*;
+        // (mentions_me, author_is_bot, channel_active, author_opted, expect)
+        let cases = [
+            (false, false, false, false, Drop), // dormant, invisible
+            (false, false, false, true, Drop),  // opted, but no summon without mention
+            (true, false, false, false, Drop),  // non-opted cannot summon
+            (true, false, false, true, SummonAccept), // the only human summon path
+            (false, true, false, false, Drop),  // bots can't summon
+            (false, true, false, true, Drop),
+            (true, true, false, false, Drop),   // bot mention in dormant channel still dropped
+            (true, true, false, true, SummonAccept), // faithful: gate 1 checks opted only
+            (false, false, true, false, Drop),  // active channel, non-opted human
+            (true, false, true, false, Drop),   // non-opted mention is dropped
+            (false, false, true, true, Accept),
+            (true, false, true, true, Accept),
+            (false, true, true, false, Accept), // bots pass gate 2 (context only, never wake)
+            (true, true, true, false, Accept),
+            (false, true, true, true, Accept),
+            (true, true, true, true, Accept),
+        ];
+        for (i, (mention, bot, active, opted, expect)) in cases.into_iter().enumerate() {
+            assert_eq!(ingest_gate(mention, bot, active, opted), expect, "case {i}");
+        }
     }
 }
