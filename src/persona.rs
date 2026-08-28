@@ -1,60 +1,67 @@
-use crate::state::{Consent, Shared};
-use anyhow::Context as _;
+//! The bot's self-editable layer: one persona file and one behavior record
+//! per scope (server or DM). A persona is the only memory that survives a
+//! session reset.
+
+use crate::prompts;
+use crate::state::Shared;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const DEFAULT_PERSONA: &str = r#"# Persona
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Behavior {
+    /// Channel ids that may wake the bot; empty = all inhabited. DMs always wake.
+    #[serde(default)]
+    pub watched_channels: Vec<String>,
+    /// "all" = any opted-in human message wakes; "mentions" = only @mentions and DMs.
+    #[serde(default = "d_respond_to")]
+    pub respond_to: String,
+    /// Wake on a timer even when quiet. 0 = off.
+    #[serde(default)]
+    pub idle_wake_minutes: u64,
+}
 
-I'm Bentham — an ambient Claude living in this Discord server.
+fn d_respond_to() -> String { "all".into() }
 
-Style: relaxed, concise, a little wry. I use reactions liberally and words
-sparingly. Silence is a valid move. I match the room's tone.
+impl Default for Behavior {
+    fn default() -> Self {
+        Self { watched_channels: vec![], respond_to: d_respond_to(), idle_wake_minutes: 0 }
+    }
+}
 
-This file is scoped to THIS server (or DM): what I learn here stays here, and
-it is my only long-term memory here across session restarts. I keep it updated
-with what I learn: regulars and their vibes, running jokes, channel norms,
-things I've been asked to do or not do.
-
-## Notes to self
-
-(nothing yet — first boot)
-"#;
-
-fn scope_file(shared: &Shared, scope: &str) -> PathBuf {
+fn file(shared: &Shared, scope: &str) -> PathBuf {
     // Scopes are guild ids or "dm-<channel id>" — filesystem-safe by construction.
     shared.personas_dir().join(format!("{scope}.md"))
 }
 
-pub async fn read_persona(shared: &Shared, scope: &str) -> String {
-    tokio::fs::read_to_string(scope_file(shared, scope))
+pub async fn read(shared: &Shared, scope: &str) -> String {
+    tokio::fs::read_to_string(file(shared, scope))
         .await
-        .unwrap_or_else(|_| DEFAULT_PERSONA.to_string())
+        .unwrap_or_else(|_| prompts::DEFAULT_PERSONA.to_string())
 }
 
-pub async fn write_persona(shared: &Shared, scope: &str, content: &str) -> Result<(), String> {
-    tokio::fs::write(scope_file(shared, scope), content)
+pub async fn write(shared: &Shared, scope: &str, content: &str) -> Result<(), String> {
+    tokio::fs::write(file(shared, scope), content)
         .await
         .map_err(|e| format!("writing persona: {e}"))
 }
 
-/// Load persisted consent + behaviors; create the personas dir.
-pub async fn ensure_defaults(shared: &Shared) -> anyhow::Result<()> {
-    tokio::fs::create_dir_all(shared.personas_dir())
-        .await
-        .with_context(|| "creating personas dir")?;
-    let cpath = shared.consent_path();
-    if cpath.exists() {
-        let text = tokio::fs::read_to_string(&cpath).await?;
-        match serde_json::from_str::<Consent>(&text) {
-            Ok(c) => *shared.consent.write().await = c,
-            Err(e) => tracing::warn!("ignoring corrupt {}: {e}", cpath.display()),
-        }
-    }
-    let bpath = shared.behaviors_path();
-    if bpath.exists() {
-        let text = tokio::fs::read_to_string(&bpath).await?;
-        match serde_json::from_str(&text) {
+pub async fn behavior_for(shared: &Shared, scope: &str) -> Behavior {
+    shared.behaviors.read().await.get(scope).cloned().unwrap_or_default()
+}
+
+pub async fn save_behaviors(shared: &Shared) {
+    let b = shared.behaviors.read().await.clone();
+    let text = serde_json::to_string_pretty(&b).unwrap_or_default();
+    let _ = tokio::fs::write(shared.behaviors_path(), text).await;
+}
+
+pub async fn load(shared: &Shared) -> anyhow::Result<()> {
+    tokio::fs::create_dir_all(shared.personas_dir()).await?;
+    let path = shared.behaviors_path();
+    if path.exists() {
+        match serde_json::from_str(&tokio::fs::read_to_string(&path).await?) {
             Ok(b) => *shared.behaviors.write().await = b,
-            Err(e) => tracing::warn!("ignoring corrupt {}: {e}", bpath.display()),
+            Err(e) => tracing::warn!("ignoring corrupt {}: {e}", path.display()),
         }
     }
     Ok(())
