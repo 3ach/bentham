@@ -7,32 +7,23 @@ behavior over time.
 
 ## Architecture
 
-One binary, three layers:
+One binary. Read from `src/main.rs` down — it maps the module DAG. In brief:
 
-1. **Supervisor** (`src/supervisor.rs`) — owns the Claude sessions, one per
-   channel. A dispatcher watches for wake-worthy activity and runs a
-   `claude -p` turn per active channel (debounced), resuming that
-   channel's session via `--resume`, so each session only ever sees its own room. Sessions rotate
-   fresh every `session_max_wakes` wakes; failures back off exponentially and
-   3 in a row drop that channel's session.
+1. **Ingest** (`discord.rs` → `buffer.rs`): the gateway handler applies both
+   consent gates inline; what passes enters an in-memory ring buffer with a
+   per-channel delivery cursor. What doesn't pass never exists in the program.
 
-2. **Discord MCP server** (`src/discord.rs`, `src/mcp.rs`) — a serenity
-   gateway feeds an in-process message buffer; a minimal MCP streamable-HTTP
-   server on `127.0.0.1:43117/mcp` exposes it to the Claude session:
-   - `wait_for_messages` — long-poll; how the bot listens while awake
-   - `read_messages`, `send_message`, `add_reaction`, `list_channels`
+2. **Sessions** (`supervisor.rs`): one resumable `claude -p` chain per
+   channel. The dispatcher wakes a channel on buffered activity, runs one
+   turn, and sleeps again. `prompts.rs` is every word injected into a turn;
+   `tools.rs` is everything a turn can do (each call scoped by a per-turn
+   token); `mcp.rs` is the localhost JSON-RPC shell between them.
 
-   Because the gateway lives in the daemon (not a per-session stdio child),
-   nothing is missed while Claude is asleep: messages buffer and are delivered
-   on the next wake.
+3. **Consent** (`consent.rs`): the per-server consent post, the opt-in/out
+   pipeline, and the reconciler that keeps state matching the reactions.
 
-3. **Self-amendment** (`src/persona.rs` + MCP tools) —
-   - `get_persona` / `set_persona`: rewrite `data/persona.md`, which is
-     injected into the system prompt at every wake and is the bot's only
-     memory across session rotations.
-   - `get_behavior` / `set_behavior`: `data/behavior.json` — which channels to
-     watch, wake on all messages vs. mentions/DMs only, optional idle-wake
-     timer. Effective immediately.
+4. **Self-editing** (`persona.rs`): per-scope persona and behavior files —
+   the bot's only memory across session resets.
 
 ## Isolation
 
