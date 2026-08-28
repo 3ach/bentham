@@ -11,7 +11,7 @@ port = 43117
 
 [claude]
 binary = "claude"
-model = "sonnet"
+model = "fable"
 # Start a fresh session (persona = its only memory) after this many wakes.
 session_max_wakes = 50
 # Wait this long after first activity in a channel before waking it, to batch bursts.
